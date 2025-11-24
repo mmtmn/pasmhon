@@ -54,12 +54,12 @@ speedup: 73.20814812582314
 - [x] list comprehensions
 - [x] dict comprehensions
 - [x] yield (basic)
-- [ ] generator expressions
-- [ ] async / await (syntax + minimal execution)
-- [ ] with statements (simple context managers)
-- [ ] enumerate, zip, map, filter
-- [ ] real slicing semantics (full Python behavior)
-- [ ] unicode correctness (parsing + string ops)
+- [x] generator expressions
+- [x] async / await (syntax + minimal execution)
+- [x] with statements (simple context managers)
+- [x] enumerate, zip, map, filter
+- [x] real slicing semantics (full Python behavior)
+- [x] unicode correctness (parsing + string ops)
 
 
 **Phase 2: Advanced Language Constructs**

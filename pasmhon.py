@@ -88,6 +88,11 @@ KEYWORDS = {
     "if": "IF",
     "def": "DEF",
     "return": "RETURN",
+    "while": "WHILE",
+    "for": "FOR",
+    "in": "IN",
+    "break": "BREAK",
+    "continue": "CONTINUE",
 }
 
 def lex_line(line):
@@ -204,6 +209,17 @@ class IfStmt:
     body: list
 
 @dataclass
+class WhileStmt:
+    cond: object
+    body: list
+
+@dataclass
+class ForStmt:
+    var: str
+    iterable: object
+    body: list
+
+@dataclass
 class FuncDef:
     name: str
     param: object
@@ -212,6 +228,14 @@ class FuncDef:
 @dataclass
 class ReturnStmt:
     expr: object
+
+@dataclass
+class BreakStmt:
+    pass
+
+@dataclass
+class ContinueStmt:
+    pass
 
 @dataclass
 class ExprStmt:
@@ -273,6 +297,10 @@ class Parser:
     def parse_stmt(self):
         if self.cur.type == "IF":
             return self.parse_if()
+        if self.cur.type == "WHILE":
+            return self.parse_while()
+        if self.cur.type == "FOR":
+            return self.parse_for()
         if self.cur.type == "DEF":
             return self.parse_funcdef()
         node = self.parse_simple_stmt()
@@ -285,6 +313,12 @@ class Parser:
             return self.parse_print()
         if self.cur.type == "RETURN":
             return self.parse_return()
+        if self.cur.type == "BREAK":
+            self.eat("BREAK")
+            return BreakStmt()
+        if self.cur.type == "CONTINUE":
+            self.eat("CONTINUE")
+            return ContinueStmt()
         if self.cur.type == "IDENT" and self.peek().type == "EQ":
             return self.parse_assign()
         expr = self.parse_expr()
@@ -327,6 +361,61 @@ class Parser:
             if self.cur.type == "NEWLINE":
                 self.eat("NEWLINE")
         return IfStmt(cond, body)
+
+    def parse_while(self):
+        self.eat("WHILE")
+        cond_tokens = []
+        while self.cur.type not in ("COLON", "EOF"):
+            cond_tokens.append(self.cur)
+            self.i += 1
+        if self.cur.type != "COLON":
+            raise SyntaxError("expected ':' after while condition")
+        self.eat("COLON")
+        cond_parser = Parser(cond_tokens + [Token("EOF", None)])
+        cond = cond_parser.parse_expr()
+        body = []
+        if self.cur.type == "NEWLINE":
+            self.eat("NEWLINE")
+            self.eat("INDENT")
+            while self.cur.type not in ("DEDENT", "EOF"):
+                body.append(self.parse_stmt())
+            self.eat("DEDENT")
+        else:
+            body.append(self.parse_simple_stmt())
+            if self.cur.type == "NEWLINE":
+                self.eat("NEWLINE")
+        return WhileStmt(cond, body)
+
+    def parse_for(self):
+        self.eat("FOR")
+        if self.cur.type != "IDENT":
+            raise SyntaxError("expected loop variable name")
+        var = self.cur.value
+        self.eat("IDENT")
+        if self.cur.type != "IN":
+            raise SyntaxError("expected 'in' in for loop")
+        self.eat("IN")
+        iter_tokens = []
+        while self.cur.type not in ("COLON", "EOF"):
+            iter_tokens.append(self.cur)
+            self.i += 1
+        if self.cur.type != "COLON":
+            raise SyntaxError("expected ':' after for iterable")
+        self.eat("COLON")
+        iter_parser = Parser(iter_tokens + [Token("EOF", None)])
+        iterable = iter_parser.parse_expr()
+        body = []
+        if self.cur.type == "NEWLINE":
+            self.eat("NEWLINE")
+            self.eat("INDENT")
+            while self.cur.type not in ("DEDENT", "EOF"):
+                body.append(self.parse_stmt())
+            self.eat("DEDENT")
+        else:
+            body.append(self.parse_simple_stmt())
+            if self.cur.type == "NEWLINE":
+                self.eat("NEWLINE")
+        return ForStmt(var, iterable, body)
 
     def parse_funcdef(self):
         self.eat("DEF")
@@ -449,6 +538,12 @@ class ReturnException(Exception):
     def __init__(self, value):
         self.value = value
 
+class BreakException(Exception):
+    pass
+
+class ContinueException(Exception):
+    pass
+
 class Env:
     def __init__(self, parent=None):
         self.vars = {}
@@ -503,12 +598,38 @@ def eval_stmt(stmt, env, out):
         cond = eval_expr(stmt.cond, env)
         if bool(cond):
             eval_block(stmt.body, env, out)
+    elif isinstance(stmt, WhileStmt):
+        while bool(eval_expr(stmt.cond, env)):
+            try:
+                eval_block(stmt.body, env, out)
+            except BreakException:
+                break
+            except ContinueException:
+                continue
+    elif isinstance(stmt, ForStmt):
+        iterable_val = eval_expr(stmt.iterable, env)
+        try:
+            iterator = iter(iterable_val)
+        except TypeError:
+            raise RuntimeError("object not iterable in for loop")
+        for value in iterator:
+            env.set_var(stmt.var, value)
+            try:
+                eval_block(stmt.body, env, out)
+            except BreakException:
+                break
+            except ContinueException:
+                continue
     elif isinstance(stmt, FuncDef):
         fn = FunctionObject(stmt.name, stmt.param, stmt.body, env)
         env.set_func(stmt.name, fn)
     elif isinstance(stmt, ReturnStmt):
         val = eval_expr(stmt.expr, env)
         raise ReturnException(val)
+    elif isinstance(stmt, BreakStmt):
+        raise BreakException()
+    elif isinstance(stmt, ContinueStmt):
+        raise ContinueException()
     elif isinstance(stmt, ExprStmt):
         eval_expr(stmt.expr, env)
     else:
@@ -551,6 +672,11 @@ def eval_expr(expr, env):
                 return left != right
         raise RuntimeError(f"unsupported operator {op}")
     if isinstance(expr, Call):
+        if expr.name == "range":
+            if expr.arg is None:
+                raise RuntimeError("range() needs 1 argument for now")
+            stop = eval_expr(expr.arg, env)
+            return range(int(stop))
         fn = env.get_func(expr.name)
         local = Env(parent=fn.env)
         if fn.param is not None:

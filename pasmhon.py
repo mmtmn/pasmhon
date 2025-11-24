@@ -93,6 +93,7 @@ KEYWORDS = {
     "in": "IN",
     "break": "BREAK",
     "continue": "CONTINUE",
+    "class": "CLASS",
 }
 
 def lex_line(line):
@@ -199,9 +200,22 @@ def lex(src):
 class Program:
     stmts: list
 
+# statements
 @dataclass
 class Assign:
     name: str
+    expr: object
+
+@dataclass
+class AttrAssign:
+    obj: object
+    name: str
+    expr: object
+
+@dataclass
+class IndexAssign:
+    seq: object
+    index: object
     expr: object
 
 @dataclass
@@ -225,9 +239,14 @@ class ForStmt:
     body: list
 
 @dataclass
+class ClassDef:
+    name: str
+    body: list
+
+@dataclass
 class FuncDef:
     name: str
-    param: object
+    params: list
     body: list
 
 @dataclass
@@ -246,6 +265,7 @@ class ContinueStmt:
 class ExprStmt:
     expr: object
 
+# expressions
 @dataclass
 class IntLit:
     value: int
@@ -265,11 +285,6 @@ class BinOp:
     right: object
 
 @dataclass
-class Call:
-    name: str
-    arg: object
-
-@dataclass
 class ListLit:
     elements: list
 
@@ -283,10 +298,20 @@ class Index:
     index: object
 
 @dataclass
+class Attr:
+    obj: object
+    name: str
+
+@dataclass
+class Call:
+    name: str
+    args: list
+
+@dataclass
 class MethodCall:
     obj: object
     name: str
-    arg: object
+    args: list
 
 # =========================
 # Parser
@@ -319,6 +344,8 @@ class Parser:
         return Program(stmts)
 
     def parse_stmt(self):
+        if self.cur.type == "CLASS":
+            return self.parse_classdef()
         if self.cur.type == "IF":
             return self.parse_if()
         if self.cur.type == "WHILE":
@@ -343,9 +370,17 @@ class Parser:
         if self.cur.type == "CONTINUE":
             self.eat("CONTINUE")
             return ContinueStmt()
-        if self.cur.type == "IDENT" and self.peek().type == "EQ":
-            return self.parse_assign()
+
         expr = self.parse_expr()
+        if self.cur.type == "EQ" and isinstance(expr, (Var, Attr, Index)):
+            self.eat("EQ")
+            value = self.parse_expr()
+            if isinstance(expr, Var):
+                return Assign(expr.name, value)
+            if isinstance(expr, Attr):
+                return AttrAssign(expr.obj, expr.name, value)
+            if isinstance(expr, Index):
+                return IndexAssign(expr.seq, expr.index, value)
         return ExprStmt(expr)
 
     def parse_print(self):
@@ -355,12 +390,25 @@ class Parser:
         self.eat("RPAREN")
         return PrintStmt(expr)
 
-    def parse_assign(self):
+    def parse_classdef(self):
+        self.eat("CLASS")
+        if self.cur.type != "IDENT":
+            raise SyntaxError("expected class name")
         name = self.cur.value
         self.eat("IDENT")
-        self.eat("EQ")
-        expr = self.parse_expr()
-        return Assign(name, expr)
+        self.eat("COLON")
+        body = []
+        if self.cur.type == "NEWLINE":
+            self.eat("NEWLINE")
+            self.eat("INDENT")
+            while self.cur.type not in ("DEDENT", "EOF"):
+                body.append(self.parse_stmt())
+            self.eat("DEDENT")
+        else:
+            body.append(self.parse_simple_stmt())
+            if self.cur.type == "NEWLINE":
+                self.eat("NEWLINE")
+        return ClassDef(name, body)
 
     def parse_if(self):
         self.eat("IF")
@@ -448,10 +496,16 @@ class Parser:
         name = self.cur.value
         self.eat("IDENT")
         self.eat("LPAREN")
-        param = None
+        params = []
         if self.cur.type == "IDENT":
-            param = self.cur.value
+            params.append(self.cur.value)
             self.eat("IDENT")
+            while self.cur.type == "COMMA":
+                self.eat("COMMA")
+                if self.cur.type != "IDENT":
+                    raise SyntaxError("expected parameter name")
+                params.append(self.cur.value)
+                self.eat("IDENT")
         self.eat("RPAREN")
         self.eat("COLON")
         body = []
@@ -465,7 +519,7 @@ class Parser:
             body.append(self.parse_simple_stmt())
             if self.cur.type == "NEWLINE":
                 self.eat("NEWLINE")
-        return FuncDef(name, param, body)
+        return FuncDef(name, params, body)
 
     def parse_return(self):
         self.eat("RETURN")
@@ -572,12 +626,16 @@ class Parser:
             self.eat("IDENT")
             if self.cur.type == "LPAREN":
                 self.eat("LPAREN")
-                if self.cur.type == "RPAREN":
-                    self.eat("RPAREN")
-                    return Call(name, None)
-                arg = self.parse_expr()
+                args = []
+                if self.cur.type != "RPAREN":
+                    args.append(self.parse_expr())
+                    while self.cur.type == "COMMA":
+                        self.eat("COMMA")
+                        if self.cur.type == "RPAREN":
+                            break
+                        args.append(self.parse_expr())
                 self.eat("RPAREN")
-                return Call(name, arg)
+                return Call(name, args)
             return Var(name)
         if tok.type == "LPAREN":
             self.eat("LPAREN")
@@ -596,20 +654,28 @@ class Parser:
             if self.cur.type == "DOT":
                 self.eat("DOT")
                 if self.cur.type != "IDENT":
-                    raise SyntaxError("expected method name after '.'")
-                method_name = self.cur.value
+                    raise SyntaxError("expected name after '.'")
+                name = self.cur.value
                 self.eat("IDENT")
-                self.eat("LPAREN")
-                arg = None
-                if self.cur.type != "RPAREN":
-                    arg = self.parse_expr()
-                self.eat("RPAREN")
-                node = MethodCall(node, method_name, arg)
+                if self.cur.type == "LPAREN":
+                    self.eat("LPAREN")
+                    args = []
+                    if self.cur.type != "RPAREN":
+                        args.append(self.parse_expr())
+                        while self.cur.type == "COMMA":
+                            self.eat("COMMA")
+                            if self.cur.type == "RPAREN":
+                                break
+                            args.append(self.parse_expr())
+                    self.eat("RPAREN")
+                    node = MethodCall(node, name, args)
+                else:
+                    node = Attr(node, name)
             elif self.cur.type == "LBRACK":
                 self.eat("LBRACK")
-                index_expr = self.parse_expr()
+                idx = self.parse_expr()
                 self.eat("RBRACK")
-                node = Index(node, index_expr)
+                node = Index(node, idx)
             else:
                 break
         return node
@@ -632,6 +698,7 @@ class Env:
     def __init__(self, parent=None):
         self.vars = {}
         self.funcs = {}
+        self.classes = {}
         self.parent = parent
 
     def get_var(self, name):
@@ -654,12 +721,34 @@ class Env:
     def set_func(self, name, fn):
         self.funcs[name] = fn
 
+    def get_class(self, name):
+        if name in self.classes:
+            return self.classes[name]
+        if self.parent:
+            return self.parent.get_class(name)
+        raise NameError(f"undefined class {name}")
+
+    def set_class(self, name, cls):
+        self.classes[name] = cls
+
 @dataclass
 class FunctionObject:
     name: str
-    param: object
+    params: list
     body: list
     env: Env
+    is_method: bool = False
+
+@dataclass
+class ClassObject:
+    name: str
+    methods: dict
+    attributes: dict
+
+@dataclass
+class InstanceObject:
+    cls: ClassObject
+    fields: dict
 
 def eval_block(stmts, env, out):
     for s in stmts:
@@ -675,6 +764,21 @@ def eval_stmt(stmt, env, out):
     if isinstance(stmt, Assign):
         val = eval_expr(stmt.expr, env)
         env.set_var(stmt.name, val)
+    elif isinstance(stmt, AttrAssign):
+        obj = eval_expr(stmt.obj, env)
+        val = eval_expr(stmt.expr, env)
+        if isinstance(obj, InstanceObject):
+            obj.fields[stmt.name] = val
+        else:
+            raise RuntimeError("attribute assignment only supported on objects")
+    elif isinstance(stmt, IndexAssign):
+        seq = eval_expr(stmt.seq, env)
+        idx = eval_expr(stmt.index, env)
+        val = eval_expr(stmt.expr, env)
+        try:
+            seq[idx] = val
+        except Exception as e:
+            raise RuntimeError(f"index assignment error: {e}")
     elif isinstance(stmt, PrintStmt):
         val = eval_expr(stmt.expr, env)
         out.append(str(val) + "\n")
@@ -704,8 +808,19 @@ def eval_stmt(stmt, env, out):
                 break
             except ContinueException:
                 continue
+    elif isinstance(stmt, ClassDef):
+        class_env = Env(parent=env)
+        tmp_out = []
+        eval_block(stmt.body, class_env, tmp_out)
+        methods = {}
+        for name, fn in class_env.funcs.items():
+            methods[name] = FunctionObject(fn.name, fn.params, fn.body, fn.env, is_method=True)
+        attrs = dict(class_env.vars)
+        cls_obj = ClassObject(stmt.name, methods, attrs)
+        env.set_class(stmt.name, cls_obj)
+        env.set_var(stmt.name, cls_obj)
     elif isinstance(stmt, FuncDef):
-        fn = FunctionObject(stmt.name, stmt.param, stmt.body, env)
+        fn = FunctionObject(stmt.name, stmt.params, stmt.body, env, is_method=False)
         env.set_func(stmt.name, fn)
     elif isinstance(stmt, ReturnStmt):
         val = eval_expr(stmt.expr, env)
@@ -742,32 +857,70 @@ def eval_expr(expr, env):
             return seq_val[idx_val]
         except Exception as e:
             raise RuntimeError(f"index error: {e}")
+    if isinstance(expr, Attr):
+        obj = eval_expr(expr.obj, env)
+        name = expr.name
+        if isinstance(obj, InstanceObject):
+            if name in obj.fields:
+                return obj.fields[name]
+            if name in obj.cls.attributes:
+                return obj.cls.attributes[name]
+            if name in obj.cls.methods:
+                return obj.cls.methods[name]
+            raise RuntimeError(f"attribute {name} not found")
+        if isinstance(obj, ClassObject):
+            if name in obj.attributes:
+                return obj.attributes[name]
+            if name in obj.methods:
+                return obj.methods[name]
+            raise RuntimeError(f"class attribute {name} not found")
+        raise RuntimeError("attribute access only supported on objects")
     if isinstance(expr, MethodCall):
         obj = eval_expr(expr.obj, env)
-        arg_val = eval_expr(expr.arg, env) if expr.arg is not None else None
         name = expr.name
         if isinstance(obj, list):
+            args = [eval_expr(a, env) for a in expr.args]
             if name == "append":
-                obj.append(arg_val)
+                if len(args) != 1:
+                    raise RuntimeError("list.append needs 1 arg")
+                obj.append(args[0])
                 return None
             if name == "pop":
-                if expr.arg is None:
+                if len(args) == 0:
                     return obj.pop()
-                return obj.pop(arg_val)
+                if len(args) == 1:
+                    return obj.pop(args[0])
+                raise RuntimeError("list.pop takes at most 1 arg")
             if name == "sort":
+                if len(args) != 0:
+                    raise RuntimeError("list.sort takes no args")
                 obj.sort()
                 return None
             raise RuntimeError(f"unsupported list method {name}")
         if isinstance(obj, dict):
+            args = [eval_expr(a, env) for a in expr.args]
             if name == "keys":
+                if args:
+                    raise RuntimeError("dict.keys takes no args")
                 return list(obj.keys())
             if name == "values":
+                if args:
+                    raise RuntimeError("dict.values takes no args")
                 return list(obj.values())
             if name == "items":
+                if args:
+                    raise RuntimeError("dict.items takes no args")
                 return list(obj.items())
             if name == "get":
-                return obj.get(arg_val)
+                if len(args) != 1:
+                    raise RuntimeError("dict.get needs 1 arg")
+                return obj.get(args[0])
             raise RuntimeError(f"unsupported dict method {name}")
+        if isinstance(obj, InstanceObject):
+            fn = obj.cls.methods.get(name)
+            if fn is None:
+                raise RuntimeError(f"unknown method {name} on {obj.cls.name}")
+            return call_method(obj, fn, expr.args, env)
         raise RuntimeError(f"method {name} not supported on type {type(obj).__name__}")
     if isinstance(expr, BinOp):
         left = eval_expr(expr.left, env)
@@ -799,33 +952,68 @@ def eval_expr(expr, env):
                 return left != right
         raise RuntimeError(f"unsupported operator {op}")
     if isinstance(expr, Call):
+        # builtins
         if expr.name == "range":
-            if expr.arg is None:
-                raise RuntimeError("range() needs 1 argument for now")
-            stop = eval_expr(expr.arg, env)
+            if len(expr.args) != 1:
+                raise RuntimeError("range() supports exactly 1 arg here")
+            stop = eval_expr(expr.args[0], env)
             return range(int(stop))
         if expr.name == "len":
-            if expr.arg is None:
+            if len(expr.args) != 1:
                 raise RuntimeError("len() needs 1 argument")
-            val = eval_expr(expr.arg, env)
+            val = eval_expr(expr.args[0], env)
             try:
                 return len(val)
             except TypeError:
                 raise RuntimeError("object has no len()")
-        fn = env.get_func(expr.name)
-        local = Env(parent=fn.env)
-        if fn.param is not None:
-            if expr.arg is not None:
-                arg_val = eval_expr(expr.arg, env)
-            else:
-                arg_val = None
-            local.set_var(fn.param, arg_val)
+
+        # function or class
         try:
-            eval_block(fn.body, local, out=[])
-            return None
-        except ReturnException as r:
-            return r.value
+            fn = env.get_func(expr.name)
+            return call_function(fn, expr.args, env)
+        except NameError:
+            cls = env.get_class(expr.name)
+            return call_class(cls, expr.args, env)
+
     raise RuntimeError("unknown expression")
+
+def call_function(fn, args_exprs, env):
+    local = Env(parent=fn.env)
+    if len(args_exprs) != len(fn.params):
+        raise RuntimeError(f"{fn.name} expected {len(fn.params)} args, got {len(args_exprs)}")
+    for name, expr_arg in zip(fn.params, args_exprs):
+        val = eval_expr(expr_arg, env)
+        local.set_var(name, val)
+    try:
+        eval_block(fn.body, local, out=[])
+        return None
+    except ReturnException as r:
+        return r.value
+
+def call_method(instance, fn, args_exprs, env):
+    local = Env(parent=fn.env)
+    if not fn.params:
+        raise RuntimeError("method must have at least one parameter (self)")
+    self_name = fn.params[0]
+    local.set_var(self_name, instance)
+    expected = len(fn.params) - 1
+    if len(args_exprs) != expected:
+        raise RuntimeError(f"{fn.name} expected {expected} args, got {len(args_exprs)}")
+    for name, expr_arg in zip(fn.params[1:], args_exprs):
+        val = eval_expr(expr_arg, env)
+        local.set_var(name, val)
+    try:
+        eval_block(fn.body, local, out=[])
+        return None
+    except ReturnException as r:
+        return r.value
+
+def call_class(cls, args_exprs, env):
+    inst = InstanceObject(cls, fields=dict(cls.attributes))
+    init = cls.methods.get("__init__")
+    if init is not None:
+        call_method(inst, init, args_exprs, env)
+    return inst
 
 # =========================
 # Main

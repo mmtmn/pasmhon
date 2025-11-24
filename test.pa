@@ -10,3 +10,14 @@ def f(n):
     return n * 2
 
 print(f(x))
+
+x = 0
+while x < 5:
+    if x == 3:
+        x = x + 1
+        continue
+    print(x)
+    x = x + 1
+
+for i in range(3):
+    print(i)

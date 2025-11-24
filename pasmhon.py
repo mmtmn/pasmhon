@@ -115,6 +115,23 @@ KEYWORDS = {
     "import":   "IMPORT",
 }
 
+def strip_block_comments(src):
+    out = []
+    i = 0
+    n = len(src)
+    while i < n:
+        if i + 1 < n and src[i] == "/" and src[i+1] == "*":
+            i += 2
+            while i + 1 < n and not (src[i] == "*" and src[i+1] == "/"):
+                i += 1
+            if i + 1 >= n:
+                break
+            i += 2
+            continue
+        out.append(src[i])
+        i += 1
+    return "".join(out)
+
 def lex_line(line):
     tokens = []
     i = 0
@@ -124,6 +141,8 @@ def lex_line(line):
         if c in " \t":
             i += 1
             continue
+        if c == "#":
+            break
         if c.isdigit():
             start = i
             while i < n and line[i].isdigit():
@@ -186,6 +205,7 @@ def lex_line(line):
     return tokens
 
 def lex(src):
+    src = strip_block_comments(src)
     tokens = []
     indents = [0]
     for raw in src.splitlines():
@@ -804,7 +824,6 @@ class Parser:
                     node = Attr(node, name)
             elif self.cur.type == "LBRACK":
                 self.eat("LBRACK")
-                # slice or index
                 if self.cur.type == "COLON":
                     start = None
                 else:
@@ -1222,7 +1241,6 @@ def eval_expr(expr, env):
                 return left != right
         raise RuntimeError(f"unsupported operator {op}")
     if isinstance(expr, Call):
-        # builtins
         if expr.name == "range":
             if len(expr.args) != 1:
                 raise RuntimeError("range() supports exactly 1 arg here")
@@ -1237,7 +1255,6 @@ def eval_expr(expr, env):
             except TypeError:
                 raise RuntimeError("object has no len()")
 
-        # function or class
         try:
             fn = env.get_func(expr.name)
             return call_function(fn, expr.args, env)
@@ -1248,7 +1265,6 @@ def eval_expr(expr, env):
             return call_class(cls, expr.args, env)
         except NameError:
             pass
-
         try:
             val = env.get_var(expr.name)
             if isinstance(val, FunctionObject):
@@ -1257,10 +1273,7 @@ def eval_expr(expr, env):
                 return call_class(val, expr.args, env)
         except NameError:
             pass
-
         raise NameError(f"undefined function or class or variable {expr.name}")
-
-
 
     raise RuntimeError("unknown expression")
 
@@ -1358,10 +1371,8 @@ def call_method(instance, fn, args_exprs, env):
     annotations = fn.annotations or {}
     arg_values = []
 
-    # self
     expected_type_name = annotations.get(self_name)
     if expected_type_name is not None:
-        # we don't really enforce type on self for now
         pass
     arg_values.append((self_name, instance))
 

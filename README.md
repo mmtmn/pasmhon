@@ -35,14 +35,16 @@ speedup: 73.20814812582314
 - [x] loops
 - [x] lists and dictionaries 
 - [x] oop
-- [ ] inheritance
-- [ ] exceptions (try/except)
-- [ ] slices
-- [ ] closures and nonlocal
-- [ ] import system
-- [ ] bytecode VM
-- [ ] jit
-- [ ] static typing
+- [x] inheritance
+- [x] exceptions (try/except)
+- [x] slices
+- [x] closures and nonlocal
+- [x] import system
+- [x] bytecode VM
+- [x] jit
+- [x] static typing
+- [x] single line comments
+- [x] multi line comments 
 
 # how to:
 

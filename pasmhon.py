@@ -15,7 +15,8 @@ def build_print(msg):
     # write(1, msg, len)
     code += [0x48,0xc7,0xc0,1,0,0,0]                     # mov rax,1
     code += [0x48,0xc7,0xc7,1,0,0,0]                     # mov rdi,1
-    code += [0x48,0xbe] + list(DATAVA.to_bytes(8,'little'))  # mov rsi,msg
+    # old incorrect 32 bit rsi mov removed, use 64 bit absolute
+    code += [0x48,0xbe] + list(DATAVA.to_bytes(8, 'little'))      # mov rsi,msg
     code += [0x48,0xc7,0xc2] + list(len(msg).to_bytes(4,'little'))  # mov rdx,len
     code += [0x0f,0x05]                                  # syscall
     # exit(0)
@@ -113,24 +114,13 @@ KEYWORDS = {
     "raise":    "RAISE",
     "nonlocal": "NONLOCAL",
     "import":   "IMPORT",
+    "lambda":   "LAMBDA",
+    "yield":    "YIELD",
 }
 
 def strip_block_comments(src):
-    out = []
-    i = 0
-    n = len(src)
-    while i < n:
-        if i + 1 < n and src[i] == "/" and src[i+1] == "*":
-            i += 2
-            while i + 1 < n and not (src[i] == "*" and src[i+1] == "/"):
-                i += 1
-            if i + 1 >= n:
-                break
-            i += 2
-            continue
-        out.append(src[i])
-        i += 1
-    return "".join(out)
+    # remove /* ... */ including multiline blocks
+    return re.sub(r'/\*.*?\*/', '', src, flags=re.S)
 
 def lex_line(line):
     tokens = []
@@ -179,11 +169,13 @@ def lex_line(line):
             tokens.append(Token(ttype, two))
             i += 2
             continue
+
         single = {
             "+": "PLUS",
             "-": "MINUS",
             "*": "STAR",
             "/": "SLASH",
+            "%": "MOD",
             "(": "LPAREN",
             ")": "RPAREN",
             ":": "COLON",
@@ -197,6 +189,7 @@ def lex_line(line):
             "}": "RBRACE",
             ".": "DOT",
         }
+
         if c in single:
             tokens.append(Token(single[c], c))
             i += 1
@@ -289,9 +282,15 @@ class FuncDef:
     params: list
     annotations: dict
     body: list
+    defaults: dict | None = None
+    vararg: str | None = None
 
 @dataclass
 class ReturnStmt:
+    expr: object
+
+@dataclass
+class YieldStmt:
     expr: object
 
 @dataclass
@@ -347,8 +346,23 @@ class ListLit:
     elements: list
 
 @dataclass
+class ListComp:
+    expr: object
+    var: str
+    iterable: object
+    cond: object | None
+
+@dataclass
 class DictLit:
     items: list   # list of (key_expr, value_expr)
+
+@dataclass
+class DictComp:
+    key_expr: object
+    value_expr: object
+    var: str
+    iterable: object
+    cond: object | None
 
 @dataclass
 class Index:
@@ -368,15 +382,22 @@ class Attr:
     name: str
 
 @dataclass
+class LambdaExpr:
+    params: list
+    body: object
+
+@dataclass
 class Call:
     name: str
     args: list
+    kwargs: list   # list of (name, expr)
 
 @dataclass
 class MethodCall:
     obj: object
     name: str
     args: list
+    kwargs: list   # list of (name, expr)
 
 # =========================
 # Parser
@@ -392,7 +413,9 @@ class Parser:
         return self.tokens[self.i]
 
     def peek(self):
-        return self.tokens[self.i+1]
+        if self.i + 1 < len(self.tokens):
+            return self.tokens[self.i+1]
+        return Token("EOF", None)
 
     def eat(self, ttype):
         if self.cur.type != ttype:
@@ -433,6 +456,8 @@ class Parser:
             return self.parse_print()
         if self.cur.type == "RETURN":
             return self.parse_return()
+        if self.cur.type == "YIELD":
+            return self.parse_yield()
         if self.cur.type == "BREAK":
             self.eat("BREAK")
             return BreakStmt()
@@ -638,25 +663,42 @@ class Parser:
         self.eat("LPAREN")
         params = []
         annotations = {}
-        if self.cur.type == "IDENT":
+        defaults = {}
+        vararg = None
+        if self.cur.type != "RPAREN":
             while True:
-                pname = self.cur.value
-                self.eat("IDENT")
-                ptype = None
-                if self.cur.type == "COLON":
-                    self.eat("COLON")
+                if self.cur.type == "STAR":
+                    self.eat("STAR")
                     if self.cur.type != "IDENT":
-                        raise SyntaxError("expected type name")
-                    ptype = self.cur.value
+                        raise SyntaxError("expected vararg name after '*'")
+                    if vararg is not None:
+                        raise SyntaxError("multiple *varargs not allowed")
+                    vararg = self.cur.value
                     self.eat("IDENT")
-                params.append(pname)
-                if ptype is not None:
-                    annotations[pname] = ptype
+                else:
+                    if self.cur.type != "IDENT":
+                        raise SyntaxError("expected parameter name")
+                    pname = self.cur.value
+                    self.eat("IDENT")
+                    ptype = None
+                    if self.cur.type == "COLON":
+                        self.eat("COLON")
+                        if self.cur.type != "IDENT":
+                            raise SyntaxError("expected type name")
+                        ptype = self.cur.value
+                        self.eat("IDENT")
+                    if self.cur.type == "EQ":
+                        self.eat("EQ")
+                        default_expr = self.parse_expr()
+                        defaults[pname] = default_expr
+                    params.append(pname)
+                    if ptype is not None:
+                        annotations[pname] = ptype
                 if self.cur.type != "COMMA":
                     break
                 self.eat("COMMA")
-                if self.cur.type != "IDENT":
-                    raise SyntaxError("expected parameter name")
+                if self.cur.type == "RPAREN":
+                    break
         self.eat("RPAREN")
         self.eat("COLON")
         body = []
@@ -670,12 +712,19 @@ class Parser:
             body.append(self.parse_simple_stmt())
             if self.cur.type == "NEWLINE":
                 self.eat("NEWLINE")
-        return FuncDef(name, params, annotations, body)
+        if not defaults:
+            defaults = None
+        return FuncDef(name, params, annotations, body, defaults, vararg)
 
     def parse_return(self):
         self.eat("RETURN")
         expr = self.parse_expr()
         return ReturnStmt(expr)
+
+    def parse_yield(self):
+        self.eat("YIELD")
+        expr = self.parse_expr()
+        return YieldStmt(expr)
 
     def parse_expr(self):
         return self.parse_equality()
@@ -715,8 +764,13 @@ class Parser:
 
     def parse_factor(self):
         node = self.parse_unary()
-        while self.cur.type in ("STAR", "SLASH"):
-            op = "*" if self.cur.type == "STAR" else "/"
+        while self.cur.type in ("STAR", "SLASH", "MOD"):
+            if self.cur.type == "STAR":
+                op = "*"
+            elif self.cur.type == "SLASH":
+                op = "/"
+            else:
+                op = "%"
             self.eat(self.cur.type)
             right = self.parse_unary()
             node = BinOp(op, node, right)
@@ -734,73 +788,157 @@ class Parser:
 
     def parse_list_lit(self):
         self.eat("LBRACK")
-        elements = []
-        if self.cur.type != "RBRACK":
+        if self.cur.type == "RBRACK":
+            self.eat("RBRACK")
+            return ListLit([])
+        first = self.parse_expr()
+        if self.cur.type == "FOR":
+            self.eat("FOR")
+            if self.cur.type != "IDENT":
+                raise SyntaxError("expected loop variable in list comprehension")
+            var = self.cur.value
+            self.eat("IDENT")
+            if self.cur.type != "IN":
+                raise SyntaxError("expected 'in' in list comprehension")
+            self.eat("IN")
+            iterable = self.parse_expr()
+            cond = None
+            if self.cur.type == "IF":
+                self.eat("IF")
+                cond = self.parse_expr()
+            self.eat("RBRACK")
+            return ListComp(first, var, iterable, cond)
+        elements = [first]
+        while self.cur.type == "COMMA":
+            self.eat("COMMA")
+            if self.cur.type == "RBRACK":
+                break
             elements.append(self.parse_expr())
-            while self.cur.type == "COMMA":
-                self.eat("COMMA")
-                if self.cur.type == "RBRACK":
-                    break
-                elements.append(self.parse_expr())
         self.eat("RBRACK")
         return ListLit(elements)
 
     def parse_dict_lit(self):
         self.eat("LBRACE")
-        items = []
-        if self.cur.type != "RBRACE":
+        if self.cur.type == "RBRACE":
+            self.eat("RBRACE")
+            return DictLit([])
+        key_expr = self.parse_expr()
+        self.eat("COLON")
+        value_expr = self.parse_expr()
+        if self.cur.type == "FOR":
+            self.eat("FOR")
+            if self.cur.type != "IDENT":
+                raise SyntaxError("expected loop variable in dict comprehension")
+            var = self.cur.value
+            self.eat("IDENT")
+            if self.cur.type != "IN":
+                raise SyntaxError("expected 'in' in dict comprehension")
+            self.eat("IN")
+            iterable = self.parse_expr()
+            cond = None
+            if self.cur.type == "IF":
+                self.eat("IF")
+                cond = self.parse_expr()
+            self.eat("RBRACE")
+            return DictComp(key_expr, value_expr, var, iterable, cond)
+        items = [(key_expr, value_expr)]
+        while self.cur.type == "COMMA":
+            self.eat("COMMA")
+            if self.cur.type == "RBRACE":
+                break
             key = self.parse_expr()
             self.eat("COLON")
             value = self.parse_expr()
             items.append((key, value))
-            while self.cur.type == "COMMA":
-                self.eat("COMMA")
-                if self.cur.type == "RBRACE":
-                    break
-                key = self.parse_expr()
-                self.eat("COLON")
-                value = self.parse_expr()
-                items.append((key, value))
         self.eat("RBRACE")
         return DictLit(items)
 
+    def parse_lambda(self):
+        self.eat("LAMBDA")
+        params = []
+        defaults = {}
+
+        if self.cur.type != "COLON":
+            while True:
+                if self.cur.type != "IDENT":
+                    raise SyntaxError("expected parameter name in lambda")
+                pname = self.cur.value
+                self.eat("IDENT")
+
+                if self.cur.type == "EQ":
+                    self.eat("EQ")
+                    defaults[pname] = self.parse_expr()
+
+                params.append(pname)
+
+                if self.cur.type != "COMMA":
+                    break
+                self.eat("COMMA")
+
+        self.eat("COLON")
+        body = self.parse_expr()
+        return LambdaExpr(params=(params, defaults), body=body)
+
     def parse_atom(self):
         tok = self.cur
+
         if tok.type == "INT":
             self.eat("INT")
             return IntLit(tok.value)
+
         if tok.type == "STRING":
             self.eat("STRING")
             return StringLit(tok.value)
+
+        if tok.type == "LAMBDA":
+            return self.parse_lambda()
+
         if tok.type == "IDENT":
             name = tok.value
             self.eat("IDENT")
+
             if self.cur.type == "LPAREN":
                 self.eat("LPAREN")
                 args = []
+                kwargs = []
+
                 if self.cur.type != "RPAREN":
-                    args.append(self.parse_expr())
-                    while self.cur.type == "COMMA":
-                        self.eat("COMMA")
-                        if self.cur.type == "RPAREN":
+                    while True:
+                        if self.cur.type == "IDENT" and self.peek().type == "EQ":
+                            key = self.cur.value
+                            self.eat("IDENT")
+                            self.eat("EQ")
+                            val = self.parse_expr()
+                            kwargs.append((key, val))
+                        else:
+                            args.append(self.parse_expr())
+
+                        if self.cur.type != "COMMA":
                             break
-                        args.append(self.parse_expr())
+                        self.eat("COMMA")
+
                 self.eat("RPAREN")
-                return Call(name, args)
+                return Call(name, args, kwargs)
+
             return Var(name)
+
         if tok.type == "LPAREN":
             self.eat("LPAREN")
             expr = self.parse_expr()
             self.eat("RPAREN")
             return expr
+
         if tok.type == "LBRACK":
             return self.parse_list_lit()
+
         if tok.type == "LBRACE":
             return self.parse_dict_lit()
+
         raise SyntaxError(f"unexpected token {tok.type}")
 
     def parse_primary(self):
         node = self.parse_atom()
+
         while True:
             if self.cur.type == "DOT":
                 self.eat("DOT")
@@ -808,32 +946,45 @@ class Parser:
                     raise SyntaxError("expected name after '.'")
                 name = self.cur.value
                 self.eat("IDENT")
+
                 if self.cur.type == "LPAREN":
                     self.eat("LPAREN")
                     args = []
+                    kwargs = []
                     if self.cur.type != "RPAREN":
-                        args.append(self.parse_expr())
-                        while self.cur.type == "COMMA":
-                            self.eat("COMMA")
-                            if self.cur.type == "RPAREN":
+                        while True:
+                            if self.cur.type == "IDENT" and self.peek().type == "EQ":
+                                key = self.cur.value
+                                self.eat("IDENT")
+                                self.eat("EQ")
+                                val = self.parse_expr()
+                                kwargs.append((key, val))
+                            else:
+                                args.append(self.parse_expr())
+
+                            if self.cur.type != "COMMA":
                                 break
-                            args.append(self.parse_expr())
+                            self.eat("COMMA")
+
                     self.eat("RPAREN")
-                    node = MethodCall(node, name, args)
+                    node = MethodCall(node, name, args, kwargs)
                 else:
                     node = Attr(node, name)
+
             elif self.cur.type == "LBRACK":
                 self.eat("LBRACK")
                 if self.cur.type == "COLON":
                     start = None
                 else:
                     start = self.parse_expr()
+
                 if self.cur.type == "COLON":
                     self.eat("COLON")
                     if self.cur.type in ("RBRACK", "COLON"):
                         stop = None
                     else:
                         stop = self.parse_expr()
+
                     step = None
                     if self.cur.type == "COLON":
                         self.eat("COLON")
@@ -841,13 +992,17 @@ class Parser:
                             step = None
                         else:
                             step = self.parse_expr()
+
                     self.eat("RBRACK")
                     node = SliceIndex(node, start, stop, step)
+
                 else:
                     self.eat("RBRACK")
                     node = Index(node, start)
+
             else:
                 break
+
         return node
 
 # =========================
@@ -905,6 +1060,7 @@ class Env:
         self.classes = {}
         self.parent = parent
         self.nonlocal_vars = set()
+        self.yield_values = None
 
     def get_var(self, name):
         if name in self.vars:
@@ -924,8 +1080,10 @@ class Env:
     def set_var(self, name, value):
         if name in self.nonlocal_vars:
             self._set_nonlocal(name, value)
-        else:
-            self.vars[name] = value
+            return
+        if isinstance(value, FunctionObject):
+            self.funcs[name] = value
+        self.vars[name] = value
 
     def declare_nonlocal(self, name):
         self.nonlocal_vars.add(name)
@@ -958,6 +1116,8 @@ class FunctionObject:
     env: Env
     is_method: bool = False
     annotations: dict | None = None
+    defaults: dict | None = None    # param name -> value
+    vararg: str | None = None
     call_count: int = 0
     jit_impl: object | None = None
 
@@ -1005,32 +1165,32 @@ def eval_program(prog):
 
 def eval_stmt(stmt, env, out):
     if isinstance(stmt, Assign):
-        val = eval_expr(stmt.expr, env)
+        val = eval_expr(stmt.expr, env, out)
         env.set_var(stmt.name, val)
     elif isinstance(stmt, AttrAssign):
-        obj = eval_expr(stmt.obj, env)
-        val = eval_expr(stmt.expr, env)
+        obj = eval_expr(stmt.obj, env, out)
+        val = eval_expr(stmt.expr, env, out)
         if isinstance(obj, InstanceObject):
             obj.fields[stmt.name] = val
         else:
             raise RuntimeError("attribute assignment only supported on objects")
     elif isinstance(stmt, IndexAssign):
-        seq = eval_expr(stmt.seq, env)
-        idx = eval_expr(stmt.index, env)
-        val = eval_expr(stmt.expr, env)
+        seq = eval_expr(stmt.seq, env, out)
+        idx = eval_expr(stmt.index, env, out)
+        val = eval_expr(stmt.expr, env, out)
         try:
             seq[idx] = val
         except Exception as e:
             raise RuntimeError(f"index assignment error: {e}")
     elif isinstance(stmt, PrintStmt):
-        val = eval_expr(stmt.expr, env)
+        val = eval_expr(stmt.expr, env, out)
         out.append(str(val) + "\n")
     elif isinstance(stmt, IfStmt):
-        cond = eval_expr(stmt.cond, env)
+        cond = eval_expr(stmt.cond, env, out)
         if bool(cond):
             eval_block(stmt.body, env, out)
     elif isinstance(stmt, WhileStmt):
-        while bool(eval_expr(stmt.cond, env)):
+        while bool(eval_expr(stmt.cond, env, out)):
             try:
                 eval_block(stmt.body, env, out)
             except BreakException:
@@ -1038,7 +1198,7 @@ def eval_stmt(stmt, env, out):
             except ContinueException:
                 continue
     elif isinstance(stmt, ForStmt):
-        iterable_val = eval_expr(stmt.iterable, env)
+        iterable_val = eval_expr(stmt.iterable, env, out)
         try:
             iterator = iter(iterable_val)
         except TypeError:
@@ -1059,7 +1219,15 @@ def eval_stmt(stmt, env, out):
         for name, fn in class_env.funcs.items():
             fn.is_method = True
             methods[name] = fn
-        attrs = dict(class_env.vars)
+
+        attrs = {}
+        for k, v in class_env.vars.items():
+            if isinstance(v, FunctionObject):
+                methods[k] = v
+                v.is_method = True
+            else:
+                attrs[k] = v
+
         base_cls = None
         if stmt.base_name is not None:
             base_cls = env.get_class(stmt.base_name)
@@ -1067,8 +1235,20 @@ def eval_stmt(stmt, env, out):
         env.set_class(stmt.name, cls_obj)
         env.set_var(stmt.name, cls_obj)
     elif isinstance(stmt, FuncDef):
-        fn = FunctionObject(stmt.name, stmt.params, stmt.body, env,
-                            is_method=False, annotations=stmt.annotations)
+        defaults_values = {}
+        if stmt.defaults:
+            for pname, dexpr in stmt.defaults.items():
+                defaults_values[pname] = eval_expr(dexpr, env, out)
+        fn = FunctionObject(
+            stmt.name,
+            stmt.params,
+            stmt.body,
+            env,
+            is_method=False,
+            annotations=stmt.annotations,
+            defaults=defaults_values if defaults_values else None,
+            vararg=stmt.vararg
+        )
         env.set_var(stmt.name, fn)
         env.set_func(stmt.name, fn)
     elif isinstance(stmt, TryStmt):
@@ -1077,7 +1257,7 @@ def eval_stmt(stmt, env, out):
         except LangException:
             eval_block(stmt.handler, env, out)
     elif isinstance(stmt, RaiseStmt):
-        val = eval_expr(stmt.expr, env)
+        val = eval_expr(stmt.expr, env, out)
         raise LangException(val)
     elif isinstance(stmt, NonlocalStmt):
         for name in stmt.names:
@@ -1085,51 +1265,105 @@ def eval_stmt(stmt, env, out):
     elif isinstance(stmt, ImportStmt):
         import_module(stmt.module, env)
     elif isinstance(stmt, ReturnStmt):
-        val = eval_expr(stmt.expr, env)
+        val = eval_expr(stmt.expr, env, out)
         raise ReturnException(val)
+    elif isinstance(stmt, YieldStmt):
+        val = eval_expr(stmt.expr, env, out)
+        if env.yield_values is None:
+            env.yield_values = []
+        env.yield_values.append(val)
     elif isinstance(stmt, BreakStmt):
         raise BreakException()
     elif isinstance(stmt, ContinueStmt):
         raise ContinueException()
     elif isinstance(stmt, ExprStmt):
-        eval_expr(stmt.expr, env)
+        eval_expr(stmt.expr, env, out)
     else:
         raise RuntimeError("unknown statement")
 
-def eval_expr(expr, env):
+def eval_expr(expr, env, out):
     if isinstance(expr, IntLit):
         return expr.value
     if isinstance(expr, StringLit):
         return expr.value
     if isinstance(expr, ListLit):
-        return [eval_expr(e, env) for e in expr.elements]
+        return [eval_expr(e, env, out) for e in expr.elements]
+    if isinstance(expr, ListComp):
+        iterable_val = eval_expr(expr.iterable, env, out)
+        try:
+            iterator = iter(iterable_val)
+        except TypeError:
+            raise RuntimeError("object not iterable in list comprehension")
+        result = []
+        for value in iterator:
+            env.set_var(expr.var, value)
+            if expr.cond is not None:
+                if not bool(eval_expr(expr.cond, env, out)):
+                    continue
+            result.append(eval_expr(expr.expr, env, out))
+        return result
     if isinstance(expr, DictLit):
         d = {}
         for k_expr, v_expr in expr.items:
-            k = eval_expr(k_expr, env)
-            v = eval_expr(v_expr, env)
+            k = eval_expr(k_expr, env, out)
+            v = eval_expr(v_expr, env, out)
             d[k] = v
         return d
+    if isinstance(expr, DictComp):
+        d = {}
+        iterable_val = eval_expr(expr.iterable, env, out)
+        try:
+            iterator = iter(iterable_val)
+        except TypeError:
+            raise RuntimeError("object not iterable in dict comprehension")
+        for value in iterator:
+            env.set_var(expr.var, value)
+            if expr.cond is not None:
+                if not bool(eval_expr(expr.cond, env, out)):
+                    continue
+            k = eval_expr(expr.key_expr, env, out)
+            v = eval_expr(expr.value_expr, env, out)
+            d[k] = v
+        return d
+    if isinstance(expr, LambdaExpr):
+        body_stmt = ReturnStmt(expr.body)
+        params, defaults_ast = expr.params
+        defaults = {}
+        for k, v in defaults_ast.items():
+            defaults[k] = eval_expr(v, env, out)
+
+        fn = FunctionObject(
+            "<lambda>",
+            params,
+            [body_stmt],
+            env,
+            is_method=False,
+            annotations=None,
+            defaults=defaults if defaults else None,
+            vararg=None
+        )
+        return fn
+
     if isinstance(expr, Var):
         return env.get_var(expr.name)
     if isinstance(expr, Index):
-        seq_val = eval_expr(expr.seq, env)
-        idx_val = eval_expr(expr.index, env)
+        seq_val = eval_expr(expr.seq, env, out)
+        idx_val = eval_expr(expr.index, env, out)
         try:
             return seq_val[idx_val]
         except Exception as e:
             raise RuntimeError(f"index error: {e}")
     if isinstance(expr, SliceIndex):
-        seq_val = eval_expr(expr.seq, env)
-        start = eval_expr(expr.start, env) if expr.start is not None else None
-        stop  = eval_expr(expr.stop, env) if expr.stop is not None else None
-        step  = eval_expr(expr.step, env) if expr.step is not None else None
+        seq_val = eval_expr(expr.seq, env, out)
+        start = eval_expr(expr.start, env, out) if expr.start is not None else None
+        stop  = eval_expr(expr.stop, env, out) if expr.stop is not None else None
+        step  = eval_expr(expr.step, env, out) if expr.step is not None else None
         try:
             return seq_val[slice(start, stop, step)]
         except Exception as e:
             raise RuntimeError(f"slice error: {e}")
     if isinstance(expr, Attr):
-        obj = eval_expr(expr.obj, env)
+        obj = eval_expr(expr.obj, env, out)
         name = expr.name
         if isinstance(obj, InstanceObject):
             if name in obj.fields:
@@ -1160,10 +1394,12 @@ def eval_expr(expr, env):
             raise RuntimeError(f"module attribute {name} not found")
         raise RuntimeError("attribute access only supported on objects")
     if isinstance(expr, MethodCall):
-        obj = eval_expr(expr.obj, env)
+        obj = eval_expr(expr.obj, env, out)
         name = expr.name
         if isinstance(obj, list):
-            args = [eval_expr(a, env) for a in expr.args]
+            if expr.kwargs:
+                raise RuntimeError("list methods do not support keyword args")
+            args = [eval_expr(a, env, out) for a in expr.args]
             if name == "append":
                 if len(args) != 1:
                     raise RuntimeError("list.append needs 1 arg")
@@ -1182,7 +1418,9 @@ def eval_expr(expr, env):
                 return None
             raise RuntimeError(f"unsupported list method {name}")
         if isinstance(obj, dict):
-            args = [eval_expr(a, env) for a in expr.args]
+            if expr.kwargs:
+                raise RuntimeError("dict methods do not support keyword args")
+            args = [eval_expr(a, env, out) for a in expr.args]
             if name == "keys":
                 if args:
                     raise RuntimeError("dict.keys takes no args")
@@ -1204,28 +1442,69 @@ def eval_expr(expr, env):
             fn = class_lookup_method(obj.cls, name)
             if fn is None:
                 raise RuntimeError(f"unknown method {name} on {obj.cls.name}")
-            return call_method(obj, fn, expr.args, env)
+            return call_method(obj, fn, expr.args, expr.kwargs, env, out)
         if isinstance(obj, ModuleObject):
             fn = obj.env.funcs.get(name)
             if fn is None:
                 raise RuntimeError(f"unknown function {name} in module {obj.name}")
-            return call_function(fn, expr.args, env)
+            return call_function(fn, expr.args, expr.kwargs, env, out)
         raise RuntimeError(f"method {name} not supported on type {type(obj).__name__}")
     if isinstance(expr, BinOp):
-        left = eval_expr(expr.left, env)
-        right = eval_expr(expr.right, env)
+        left = eval_expr(expr.left, env, out)
+        right = eval_expr(expr.right, env, out)
         op = expr.op
-        if op in ("+", "-", "*", "/"):
-            if op == "+":
-                if isinstance(left, str) or isinstance(right, str):
-                    return str(left) + str(right)
-                return int(left) + int(right)
-            if op == "-":
-                return int(left) - int(right)
-            if op == "*":
-                return int(left) * int(right)
-            if op == "/":
-                return int(left) // int(right)
+
+        # ---------- addition ----------
+        if op == "+":
+            # string concat
+            if isinstance(left, str) or isinstance(right, str):
+                return str(left) + str(right)
+
+            # list concat
+            if isinstance(left, list) and isinstance(right, list):
+                return left + right
+
+            # numeric add
+            if isinstance(left, int) and isinstance(right, int):
+                return left + right
+
+            raise RuntimeError(f"unsupported + between {type(left).__name__} and {type(right).__name__}")
+
+        # ---------- subtraction ----------
+        if op == "-":
+            if isinstance(left, int) and isinstance(right, int):
+                return left - right
+            raise RuntimeError(f"unsupported - between {type(left).__name__} and {type(right).__name__}")
+
+        # ---------- multiplication ----------
+        if op == "*":
+            # int * int
+            if isinstance(left, int) and isinstance(right, int):
+                return left * right
+
+            # string * int
+            if isinstance(left, str) and isinstance(right, int):
+                return left * right
+
+            # list * int
+            if isinstance(left, list) and isinstance(right, int):
+                return left * right
+
+            raise RuntimeError(f"unsupported * between {type(left).__name__} and {type(right).__name__}")
+
+        # ---------- integer division ----------
+        if op == "/":
+            if isinstance(left, int) and isinstance(right, int):
+                return left // right
+            raise RuntimeError(f"unsupported / between {type(left).__name__} and {type(right).__name__}")
+
+        # ---------- modulo ----------
+        if op == "%":
+            if isinstance(left, int) and isinstance(right, int):
+                return left % right
+            raise RuntimeError(f"unsupported % between {type(left).__name__} and {type(right).__name__}")
+
+        # ---------- comparisons ----------
         if op in ("<", ">", "<=", ">=", "==", "!="):
             if op == "<":
                 return left < right
@@ -1239,38 +1518,41 @@ def eval_expr(expr, env):
                 return left == right
             if op == "!=":
                 return left != right
+
         raise RuntimeError(f"unsupported operator {op}")
+
     if isinstance(expr, Call):
         if expr.name == "range":
-            if len(expr.args) != 1:
-                raise RuntimeError("range() supports exactly 1 arg here")
-            stop = eval_expr(expr.args[0], env)
+            if len(expr.args) != 1 or expr.kwargs:
+                raise RuntimeError("range() supports exactly 1 positional arg here")
+            stop = eval_expr(expr.args[0], env, out)
             return range(int(stop))
         if expr.name == "len":
-            if len(expr.args) != 1:
-                raise RuntimeError("len() needs 1 argument")
-            val = eval_expr(expr.args[0], env)
+            if len(expr.args) != 1 or expr.kwargs:
+                raise RuntimeError("len() needs 1 positional argument")
+            val = eval_expr(expr.args[0], env, out)
             try:
                 return len(val)
             except TypeError:
                 raise RuntimeError("object has no len()")
 
+        # functions or classes
         try:
             fn = env.get_func(expr.name)
-            return call_function(fn, expr.args, env)
+            return call_function(fn, expr.args, expr.kwargs, env, out)
         except NameError:
             pass
         try:
             cls = env.get_class(expr.name)
-            return call_class(cls, expr.args, env)
+            return call_class(cls, expr.args, expr.kwargs, env, out)
         except NameError:
             pass
         try:
             val = env.get_var(expr.name)
             if isinstance(val, FunctionObject):
-                return call_function(val, expr.args, env)
+                return call_function(val, expr.args, expr.kwargs, env, out)
             if isinstance(val, ClassObject):
-                return call_class(val, expr.args, env)
+                return call_class(val, expr.args, expr.kwargs, env, out)
         except NameError:
             pass
         raise NameError(f"undefined function or class or variable {expr.name}")
@@ -1307,6 +1589,8 @@ def emit_python_expr(expr):
 def maybe_jit_compile(fn):
     if fn.jit_impl is not None:
         return
+    if fn.defaults or fn.vararg is not None:
+        return
     if len(fn.body) != 1 or not isinstance(fn.body[0], ReturnStmt):
         return
     expr = fn.body[0].expr
@@ -1324,85 +1608,106 @@ def maybe_jit_compile(fn):
 # Callers (functions / methods / classes)
 # =========================
 
-def call_function(fn, args_exprs, env):
+def _invoke_function(fn, pos_values, kw_values, out):
     fn.call_count += 1
     if fn.call_count >= JIT_THRESHOLD and fn.jit_impl is None:
         maybe_jit_compile(fn)
 
-    if len(args_exprs) != len(fn.params):
-        raise RuntimeError(f"{fn.name} expected {len(fn.params)} args, got {len(args_exprs)}")
-
-    arg_values = []
+    param_names = fn.params
     annotations = fn.annotations or {}
-    for name, expr_arg in zip(fn.params, args_exprs):
-        val = eval_expr(expr_arg, env)
+    defaults = fn.defaults or {}
+
+    bindings = {}
+    pos_index = 0
+
+    for name in param_names:
+        if pos_index < len(pos_values):
+            bindings[name] = pos_values[pos_index]
+            pos_index += 1
+        elif name in kw_values:
+            bindings[name] = kw_values.pop(name)
+        elif name in defaults:
+            bindings[name] = defaults[name]
+        else:
+            raise RuntimeError(f"{fn.name} missing argument {name}")
+
+    extra_pos = pos_values[pos_index:]
+    if extra_pos:
+        if fn.vararg is not None:
+            bindings[fn.vararg] = list(extra_pos)
+        else:
+            raise RuntimeError(f"{fn.name} expected at most {len(param_names)} args, got {len(pos_values)}")
+    else:
+        if fn.vararg is not None:
+            bindings[fn.vararg] = []
+
+    if kw_values:
+        bad = next(iter(kw_values.keys()))
+        raise RuntimeError(f"{fn.name} got unexpected keyword arg {bad}")
+
+    for name, val in bindings.items():
+        if fn.is_method and fn.params and name == fn.params[0]:
+            continue
         expected_type_name = annotations.get(name)
         if expected_type_name is not None:
             tp = TYPE_MAP.get(expected_type_name)
             if tp is not None and not isinstance(val, tp):
-                raise RuntimeError(f"type error in call to {fn.name}: param {name} expected {expected_type_name}, got {type(val).__name__}")
-        arg_values.append((name, val))
+                raise RuntimeError(
+                    f"type error in call to {fn.name}: param {name} expected {expected_type_name}, got {type(val).__name__}"
+                )
 
-    if fn.jit_impl is not None:
-        ordered = [v for _, v in arg_values]
+    if fn.jit_impl is not None and fn.vararg is None and not defaults:
+        ordered = [bindings[name] for name in param_names]
         return fn.jit_impl(*ordered)
 
     local = Env(parent=fn.env)
-    for name, val in arg_values:
+    for name, val in bindings.items():
         local.set_var(name, val)
+    local.yield_values = []
+
+    # generator guard
+    has_yield = False
+    for stmt in fn.body:
+        if isinstance(stmt, YieldStmt):
+            has_yield = True
+            break
+
     try:
-        eval_block(fn.body, local, out=[])
+        if has_yield:
+            eval_block(fn.body, local, out)
+            return list(local.yield_values)
+
+        eval_block(fn.body, local, out)
         return None
+
     except ReturnException as r:
+        if local.yield_values:
+            return list(local.yield_values)
         return r.value
 
-def call_method(instance, fn, args_exprs, env):
-    fn.call_count += 1
-    if fn.call_count >= JIT_THRESHOLD and fn.jit_impl is None:
-        maybe_jit_compile(fn)
+def call_function(fn, args_exprs, kwargs_exprs, env, out):
+    pos_values = [eval_expr(a, env, out) for a in args_exprs]
+    kw_values = {}
+    for key, expr_arg in kwargs_exprs:
+        if key in kw_values:
+            raise RuntimeError(f"duplicate keyword argument {key} in call to {fn.name}")
+        kw_values[key] = eval_expr(expr_arg, env, out)
+    return _invoke_function(fn, pos_values, kw_values, out)
 
-    if not fn.params:
-        raise RuntimeError("method must have at least one parameter (self)")
-    self_name = fn.params[0]
-    expected = len(fn.params) - 1
-    if len(args_exprs) != expected:
-        raise RuntimeError(f"{fn.name} expected {expected} args, got {len(args_exprs)}")
+def call_method(instance, fn, args_exprs, kwargs_exprs, env, out):
+    pos_values = [instance] + [eval_expr(a, env, out) for a in args_exprs]
+    kw_values = {}
+    for key, expr_arg in kwargs_exprs:
+        if key in kw_values:
+            raise RuntimeError(f"duplicate keyword argument {key} in call to {fn.name}")
+        kw_values[key] = eval_expr(expr_arg, env, out)
+    return _invoke_function(fn, pos_values, kw_values, out)
 
-    annotations = fn.annotations or {}
-    arg_values = []
-
-    expected_type_name = annotations.get(self_name)
-    if expected_type_name is not None:
-        pass
-    arg_values.append((self_name, instance))
-
-    for name, expr_arg in zip(fn.params[1:], args_exprs):
-        val = eval_expr(expr_arg, env)
-        expected_type_name = annotations.get(name)
-        if expected_type_name is not None:
-            tp = TYPE_MAP.get(expected_type_name)
-            if tp is not None and not isinstance(val, tp):
-                raise RuntimeError(f"type error in call to {fn.name}: param {name} expected {expected_type_name}, got {type(val).__name__}")
-        arg_values.append((name, val))
-
-    if fn.jit_impl is not None:
-        ordered = [v for _, v in arg_values]
-        return fn.jit_impl(*ordered)
-
-    local = Env(parent=fn.env)
-    for name, val in arg_values:
-        local.set_var(name, val)
-    try:
-        eval_block(fn.body, local, out=[])
-        return None
-    except ReturnException as r:
-        return r.value
-
-def call_class(cls, args_exprs, env):
+def call_class(cls, args_exprs, kwargs_exprs, env, out):
     inst = InstanceObject(cls, fields=dict(cls.attributes))
     init = class_lookup_method(cls, "__init__")
     if init is not None:
-        call_method(inst, init, args_exprs, env)
+        call_method(inst, init, args_exprs, kwargs_exprs, env, out)
     return inst
 
 # =========================

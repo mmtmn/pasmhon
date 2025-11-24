@@ -34,7 +34,15 @@ speedup: 73.20814812582314
 - [x] if statements
 - [x] loops
 - [x] lists and dictionaries 
-- [ ] oop
+- [x] oop
+- [ ] inheritance
+- [ ] exceptions (try/except)
+- [ ] slices
+- [ ] closures and nonlocal
+- [ ] import system
+- [ ] bytecode VM
+- [ ] jit
+- [ ] static typing
 
 # how to:
 

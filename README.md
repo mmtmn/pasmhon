@@ -28,4 +28,7 @@ roadmap:
 - [x] print
 - [x] variables
 - [x] simbols (+, -, /, %)
-- [ ] functions
+- [x] functions
+- [x] conditions
+- [x] if statements
+- [ ] loops 

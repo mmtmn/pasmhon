@@ -15,7 +15,7 @@ def build_print(msg):
     # write(1, msg, len)
     code += [0x48,0xc7,0xc0,1,0,0,0]                     # mov rax,1
     code += [0x48,0xc7,0xc7,1,0,0,0]                     # mov rdi,1
-    # old incorrect 32 bit rsi mov removed, use 64 bit absolute
+    # correct 64 bit absolute address for rsi
     code += [0x48,0xbe] + list(DATAVA.to_bytes(8, 'little'))      # mov rsi,msg
     code += [0x48,0xc7,0xc2] + list(len(msg).to_bytes(4,'little'))  # mov rdx,len
     code += [0x0f,0x05]                                  # syscall
@@ -89,6 +89,9 @@ TYPE_MAP = {
 JIT_THRESHOLD = 10
 MODULE_CACHE = {}
 
+# global output buffer pointer used inside function calls
+CURRENT_OUT = None
+
 # =========================
 # Lexer
 # =========================
@@ -116,6 +119,10 @@ KEYWORDS = {
     "import":   "IMPORT",
     "lambda":   "LAMBDA",
     "yield":    "YIELD",
+    "with":     "WITH",
+    "as":       "AS",
+    "async":    "ASYNC",
+    "await":    "AWAIT",
 }
 
 def strip_block_comments(src):
@@ -150,12 +157,43 @@ def lex_line(line):
         if c == '"':
             i += 1
             buf = []
-            while i < n and line[i] != '"':
-                buf.append(line[i])
+            while i < n:
+                ch = line[i]
+                if ch == '"':
+                    i += 1
+                    break
+                if ch == "\\":
+                    i += 1
+                    if i >= n:
+                        raise SyntaxError("unterminated string escape")
+                    esc = line[i]
+                    if esc == "n":
+                        buf.append("\n")
+                    elif esc == "t":
+                        buf.append("\t")
+                    elif esc == "r":
+                        buf.append("\r")
+                    elif esc == '"':
+                        buf.append('"')
+                    elif esc == "\\":
+                        buf.append("\\")
+                    elif esc == "u":
+                        if i + 4 >= n:
+                            raise SyntaxError("incomplete unicode escape")
+                        hex_digits = line[i+1:i+5]
+                        if not all(ch2 in "0123456789abcdefABCDEF" for ch2 in hex_digits):
+                            raise SyntaxError("invalid unicode escape")
+                        codepoint = int(hex_digits, 16)
+                        buf.append(chr(codepoint))
+                        i += 4
+                    else:
+                        buf.append(esc)
+                    i += 1
+                    continue
+                buf.append(ch)
                 i += 1
-            if i >= n or line[i] != '"':
+            else:
                 raise SyntaxError("unterminated string")
-            i += 1
             tokens.append(Token("STRING", "".join(buf)))
             continue
         if c in "=!<>" and i + 1 < n and line[i+1] == "=":
@@ -284,6 +322,7 @@ class FuncDef:
     body: list
     defaults: dict | None = None
     vararg: str | None = None
+    is_async: bool = False
 
 @dataclass
 class ReturnStmt:
@@ -321,6 +360,12 @@ class NonlocalStmt:
 @dataclass
 class ImportStmt:
     module: str
+
+@dataclass
+class WithStmt:
+    expr: object
+    var: str | None
+    body: list
 
 # expressions
 @dataclass
@@ -365,6 +410,13 @@ class DictComp:
     cond: object | None
 
 @dataclass
+class GenExpr:
+    expr: object
+    var: str
+    iterable: object
+    cond: object | None
+
+@dataclass
 class Index:
     seq: object
     index: object
@@ -385,6 +437,10 @@ class Attr:
 class LambdaExpr:
     params: list
     body: object
+
+@dataclass
+class AwaitExpr:
+    expr: object
 
 @dataclass
 class Call:
@@ -438,6 +494,13 @@ class Parser:
             return self.parse_try()
         if self.cur.type == "IMPORT":
             return self.parse_import()
+        if self.cur.type == "WITH":
+            return self.parse_with()
+        if self.cur.type == "ASYNC":
+            self.eat("ASYNC")
+            if self.cur.type != "DEF":
+                raise SyntaxError("expected 'def' after 'async'")
+            return self.parse_funcdef(is_async=True)
         if self.cur.type == "IF":
             return self.parse_if()
         if self.cur.type == "WHILE":
@@ -445,7 +508,7 @@ class Parser:
         if self.cur.type == "FOR":
             return self.parse_for()
         if self.cur.type == "DEF":
-            return self.parse_funcdef()
+            return self.parse_funcdef(is_async=False)
         node = self.parse_simple_stmt()
         if self.cur.type == "NEWLINE":
             self.eat("NEWLINE")
@@ -575,6 +638,32 @@ class Parser:
         self.eat("IDENT")
         return ImportStmt(name)
 
+    def parse_with(self):
+        self.eat("WITH")
+        expr = self.parse_expr()
+        var_name = None
+        if self.cur.type == "AS":
+            self.eat("AS")
+            if self.cur.type != "IDENT":
+                raise SyntaxError("expected name after 'as'")
+            var_name = self.cur.value
+            self.eat("IDENT")
+        if self.cur.type != "COLON":
+            raise SyntaxError("expected ':' after with header")
+        self.eat("COLON")
+        body = []
+        if self.cur.type == "NEWLINE":
+            self.eat("NEWLINE")
+            self.eat("INDENT")
+            while self.cur.type not in ("DEDENT", "EOF"):
+                body.append(self.parse_stmt())
+            self.eat("DEDENT")
+        else:
+            body.append(self.parse_simple_stmt())
+            if self.cur.type == "NEWLINE":
+                self.eat("NEWLINE")
+        return WithStmt(expr, var_name, body)
+
     def parse_if(self):
         self.eat("IF")
         cond_tokens = []
@@ -654,7 +743,7 @@ class Parser:
                 self.eat("NEWLINE")
         return ForStmt(var, iterable, body)
 
-    def parse_funcdef(self):
+    def parse_funcdef(self, is_async=False):
         self.eat("DEF")
         if self.cur.type != "IDENT":
             raise SyntaxError("expected function name")
@@ -714,7 +803,7 @@ class Parser:
                 self.eat("NEWLINE")
         if not defaults:
             defaults = None
-        return FuncDef(name, params, annotations, body, defaults, vararg)
+        return FuncDef(name, params, annotations, body, defaults, vararg, is_async)
 
     def parse_return(self):
         self.eat("RETURN")
@@ -784,6 +873,10 @@ class Parser:
             self.eat("MINUS")
             expr = self.parse_unary()
             return BinOp("*", IntLit(-1), expr)
+        if self.cur.type == "AWAIT":
+            self.eat("AWAIT")
+            expr = self.parse_unary()
+            return AwaitExpr(expr)
         return self.parse_primary()
 
     def parse_list_lit(self):
@@ -924,9 +1017,25 @@ class Parser:
 
         if tok.type == "LPAREN":
             self.eat("LPAREN")
-            expr = self.parse_expr()
+            first = self.parse_expr()
+            if self.cur.type == "FOR":
+                self.eat("FOR")
+                if self.cur.type != "IDENT":
+                    raise SyntaxError("expected loop variable in generator expression")
+                var = self.cur.value
+                self.eat("IDENT")
+                if self.cur.type != "IN":
+                    raise SyntaxError("expected 'in' in generator expression")
+                self.eat("IN")
+                iterable = self.parse_expr()
+                cond = None
+                if self.cur.type == "IF":
+                    self.eat("IF")
+                    cond = self.parse_expr()
+                self.eat("RPAREN")
+                return GenExpr(first, var, iterable, cond)
             self.eat("RPAREN")
-            return expr
+            return first
 
         if tok.type == "LBRACK":
             return self.parse_list_lit()
@@ -1022,7 +1131,10 @@ def compile_program_to_bytecode(prog):
     return instrs
 
 def run_bytecode(instrs, env):
+    global CURRENT_OUT
     out = []
+    prev_out = CURRENT_OUT
+    CURRENT_OUT = out
     ip = 0
     while ip < len(instrs):
         ins = instrs[ip]
@@ -1033,6 +1145,7 @@ def run_bytecode(instrs, env):
             break
         else:
             raise RuntimeError(f"unknown opcode {ins.op}")
+    CURRENT_OUT = prev_out
     return "".join(out)
 
 # =========================
@@ -1081,7 +1194,8 @@ class Env:
         if name in self.nonlocal_vars:
             self._set_nonlocal(name, value)
             return
-        if isinstance(value, FunctionObject):
+        from_types = globals().get("FunctionObject", None)
+        if from_types is not None and isinstance(value, FunctionObject):
             self.funcs[name] = value
         self.vars[name] = value
 
@@ -1120,6 +1234,7 @@ class FunctionObject:
     vararg: str | None = None
     call_count: int = 0
     jit_impl: object | None = None
+    is_async: bool = False
 
 @dataclass
 class ClassObject:
@@ -1165,32 +1280,32 @@ def eval_program(prog):
 
 def eval_stmt(stmt, env, out):
     if isinstance(stmt, Assign):
-        val = eval_expr(stmt.expr, env, out)
+        val = eval_expr(stmt.expr, env)
         env.set_var(stmt.name, val)
     elif isinstance(stmt, AttrAssign):
-        obj = eval_expr(stmt.obj, env, out)
-        val = eval_expr(stmt.expr, env, out)
+        obj = eval_expr(stmt.obj, env)
+        val = eval_expr(stmt.expr, env)
         if isinstance(obj, InstanceObject):
             obj.fields[stmt.name] = val
         else:
             raise RuntimeError("attribute assignment only supported on objects")
     elif isinstance(stmt, IndexAssign):
-        seq = eval_expr(stmt.seq, env, out)
-        idx = eval_expr(stmt.index, env, out)
-        val = eval_expr(stmt.expr, env, out)
+        seq = eval_expr(stmt.seq, env)
+        idx = eval_expr(stmt.index, env)
+        val = eval_expr(stmt.expr, env)
         try:
             seq[idx] = val
         except Exception as e:
             raise RuntimeError(f"index assignment error: {e}")
     elif isinstance(stmt, PrintStmt):
-        val = eval_expr(stmt.expr, env, out)
+        val = eval_expr(stmt.expr, env)
         out.append(str(val) + "\n")
     elif isinstance(stmt, IfStmt):
-        cond = eval_expr(stmt.cond, env, out)
+        cond = eval_expr(stmt.cond, env)
         if bool(cond):
             eval_block(stmt.body, env, out)
     elif isinstance(stmt, WhileStmt):
-        while bool(eval_expr(stmt.cond, env, out)):
+        while bool(eval_expr(stmt.cond, env)):
             try:
                 eval_block(stmt.body, env, out)
             except BreakException:
@@ -1198,7 +1313,7 @@ def eval_stmt(stmt, env, out):
             except ContinueException:
                 continue
     elif isinstance(stmt, ForStmt):
-        iterable_val = eval_expr(stmt.iterable, env, out)
+        iterable_val = eval_expr(stmt.iterable, env)
         try:
             iterator = iter(iterable_val)
         except TypeError:
@@ -1238,7 +1353,7 @@ def eval_stmt(stmt, env, out):
         defaults_values = {}
         if stmt.defaults:
             for pname, dexpr in stmt.defaults.items():
-                defaults_values[pname] = eval_expr(dexpr, env, out)
+                defaults_values[pname] = eval_expr(dexpr, env)
         fn = FunctionObject(
             stmt.name,
             stmt.params,
@@ -1247,7 +1362,8 @@ def eval_stmt(stmt, env, out):
             is_method=False,
             annotations=stmt.annotations,
             defaults=defaults_values if defaults_values else None,
-            vararg=stmt.vararg
+            vararg=stmt.vararg,
+            is_async=stmt.is_async,
         )
         env.set_var(stmt.name, fn)
         env.set_func(stmt.name, fn)
@@ -1257,18 +1373,34 @@ def eval_stmt(stmt, env, out):
         except LangException:
             eval_block(stmt.handler, env, out)
     elif isinstance(stmt, RaiseStmt):
-        val = eval_expr(stmt.expr, env, out)
+        val = eval_expr(stmt.expr, env)
         raise LangException(val)
     elif isinstance(stmt, NonlocalStmt):
         for name in stmt.names:
             env.declare_nonlocal(name)
     elif isinstance(stmt, ImportStmt):
         import_module(stmt.module, env)
+    elif isinstance(stmt, WithStmt):
+        cm_val = eval_expr(stmt.expr, env)
+        bound_val = cm_val
+        exit_fn = None
+        if isinstance(cm_val, InstanceObject):
+            enter_fn = class_lookup_method(cm_val.cls, "__enter__")
+            exit_fn = class_lookup_method(cm_val.cls, "__exit__")
+            if enter_fn is not None:
+                bound_val = _invoke_function(enter_fn, [cm_val], {})
+        if stmt.var is not None:
+            env.set_var(stmt.var, bound_val)
+        try:
+            eval_block(stmt.body, env, out)
+        finally:
+            if isinstance(cm_val, InstanceObject) and exit_fn is not None:
+                _invoke_function(exit_fn, [cm_val, None, None, None], {})
     elif isinstance(stmt, ReturnStmt):
-        val = eval_expr(stmt.expr, env, out)
+        val = eval_expr(stmt.expr, env)
         raise ReturnException(val)
     elif isinstance(stmt, YieldStmt):
-        val = eval_expr(stmt.expr, env, out)
+        val = eval_expr(stmt.expr, env)
         if env.yield_values is None:
             env.yield_values = []
         env.yield_values.append(val)
@@ -1277,19 +1409,19 @@ def eval_stmt(stmt, env, out):
     elif isinstance(stmt, ContinueStmt):
         raise ContinueException()
     elif isinstance(stmt, ExprStmt):
-        eval_expr(stmt.expr, env, out)
+        eval_expr(stmt.expr, env)
     else:
         raise RuntimeError("unknown statement")
 
-def eval_expr(expr, env, out):
+def eval_expr(expr, env):
     if isinstance(expr, IntLit):
         return expr.value
     if isinstance(expr, StringLit):
         return expr.value
     if isinstance(expr, ListLit):
-        return [eval_expr(e, env, out) for e in expr.elements]
+        return [eval_expr(e, env) for e in expr.elements]
     if isinstance(expr, ListComp):
-        iterable_val = eval_expr(expr.iterable, env, out)
+        iterable_val = eval_expr(expr.iterable, env)
         try:
             iterator = iter(iterable_val)
         except TypeError:
@@ -1298,20 +1430,20 @@ def eval_expr(expr, env, out):
         for value in iterator:
             env.set_var(expr.var, value)
             if expr.cond is not None:
-                if not bool(eval_expr(expr.cond, env, out)):
+                if not bool(eval_expr(expr.cond, env)):
                     continue
-            result.append(eval_expr(expr.expr, env, out))
+            result.append(eval_expr(expr.expr, env))
         return result
     if isinstance(expr, DictLit):
         d = {}
         for k_expr, v_expr in expr.items:
-            k = eval_expr(k_expr, env, out)
-            v = eval_expr(v_expr, env, out)
+            k = eval_expr(k_expr, env)
+            v = eval_expr(v_expr, env)
             d[k] = v
         return d
     if isinstance(expr, DictComp):
         d = {}
-        iterable_val = eval_expr(expr.iterable, env, out)
+        iterable_val = eval_expr(expr.iterable, env)
         try:
             iterator = iter(iterable_val)
         except TypeError:
@@ -1319,18 +1451,33 @@ def eval_expr(expr, env, out):
         for value in iterator:
             env.set_var(expr.var, value)
             if expr.cond is not None:
-                if not bool(eval_expr(expr.cond, env, out)):
+                if not bool(eval_expr(expr.cond, env)):
                     continue
-            k = eval_expr(expr.key_expr, env, out)
-            v = eval_expr(expr.value_expr, env, out)
+            k = eval_expr(expr.key_expr, env)
+            v = eval_expr(expr.value_expr, env)
             d[k] = v
         return d
+    if isinstance(expr, GenExpr):
+        iterable_val = eval_expr(expr.iterable, env)
+        try:
+            iterator = iter(iterable_val)
+        except TypeError:
+            raise RuntimeError("object not iterable in generator expression")
+
+        def generator():
+            for value in iterator:
+                env.set_var(expr.var, value)
+                if expr.cond is not None and not bool(eval_expr(expr.cond, env)):
+                    continue
+                yield eval_expr(expr.expr, env)
+
+        return generator()
     if isinstance(expr, LambdaExpr):
         body_stmt = ReturnStmt(expr.body)
         params, defaults_ast = expr.params
         defaults = {}
         for k, v in defaults_ast.items():
-            defaults[k] = eval_expr(v, env, out)
+            defaults[k] = eval_expr(v, env)
 
         fn = FunctionObject(
             "<lambda>",
@@ -1343,27 +1490,29 @@ def eval_expr(expr, env, out):
             vararg=None
         )
         return fn
-
+    if isinstance(expr, AwaitExpr):
+        # async is just syntax here, no real async
+        return eval_expr(expr.expr, env)
     if isinstance(expr, Var):
         return env.get_var(expr.name)
     if isinstance(expr, Index):
-        seq_val = eval_expr(expr.seq, env, out)
-        idx_val = eval_expr(expr.index, env, out)
+        seq_val = eval_expr(expr.seq, env)
+        idx_val = eval_expr(expr.index, env)
         try:
             return seq_val[idx_val]
         except Exception as e:
             raise RuntimeError(f"index error: {e}")
     if isinstance(expr, SliceIndex):
-        seq_val = eval_expr(expr.seq, env, out)
-        start = eval_expr(expr.start, env, out) if expr.start is not None else None
-        stop  = eval_expr(expr.stop, env, out) if expr.stop is not None else None
-        step  = eval_expr(expr.step, env, out) if expr.step is not None else None
+        seq_val = eval_expr(expr.seq, env)
+        start = eval_expr(expr.start, env) if expr.start is not None else None
+        stop  = eval_expr(expr.stop, env) if expr.stop is not None else None
+        step  = eval_expr(expr.step, env) if expr.step is not None else None
         try:
             return seq_val[slice(start, stop, step)]
         except Exception as e:
             raise RuntimeError(f"slice error: {e}")
     if isinstance(expr, Attr):
-        obj = eval_expr(expr.obj, env, out)
+        obj = eval_expr(expr.obj, env)
         name = expr.name
         if isinstance(obj, InstanceObject):
             if name in obj.fields:
@@ -1394,12 +1543,42 @@ def eval_expr(expr, env, out):
             raise RuntimeError(f"module attribute {name} not found")
         raise RuntimeError("attribute access only supported on objects")
     if isinstance(expr, MethodCall):
-        obj = eval_expr(expr.obj, env, out)
+        obj = eval_expr(expr.obj, env)
         name = expr.name
+                # --------------------
+        # STRING METHODS
+        # --------------------
+        if isinstance(obj, str):
+            if expr.kwargs:
+                raise RuntimeError("string methods do not support keyword args")
+            args = [eval_expr(a, env) for a in expr.args]
+
+            if name == "replace":
+                if len(args) != 2:
+                    raise RuntimeError("str.replace needs 2 args")
+                return obj.replace(args[0], args[1])
+
+            if name == "upper":
+                if args:
+                    raise RuntimeError("str.upper takes no args")
+                return obj.upper()
+
+            if name == "lower":
+                if args:
+                    raise RuntimeError("str.lower takes no args")
+                return obj.lower()
+
+            if name == "split":
+                if len(args) > 1:
+                    raise RuntimeError("str.split takes 0 or 1 arg")
+                return obj.split(*args)
+
+            raise RuntimeError(f"unsupported string method {name}")
+
         if isinstance(obj, list):
             if expr.kwargs:
                 raise RuntimeError("list methods do not support keyword args")
-            args = [eval_expr(a, env, out) for a in expr.args]
+            args = [eval_expr(a, env) for a in expr.args]
             if name == "append":
                 if len(args) != 1:
                     raise RuntimeError("list.append needs 1 arg")
@@ -1420,7 +1599,7 @@ def eval_expr(expr, env, out):
         if isinstance(obj, dict):
             if expr.kwargs:
                 raise RuntimeError("dict methods do not support keyword args")
-            args = [eval_expr(a, env, out) for a in expr.args]
+            args = [eval_expr(a, env) for a in expr.args]
             if name == "keys":
                 if args:
                     raise RuntimeError("dict.keys takes no args")
@@ -1442,119 +1621,131 @@ def eval_expr(expr, env, out):
             fn = class_lookup_method(obj.cls, name)
             if fn is None:
                 raise RuntimeError(f"unknown method {name} on {obj.cls.name}")
-            return call_method(obj, fn, expr.args, expr.kwargs, env, out)
+            return call_method(obj, fn, expr.args, expr.kwargs, env)
         if isinstance(obj, ModuleObject):
             fn = obj.env.funcs.get(name)
             if fn is None:
                 raise RuntimeError(f"unknown function {name} in module {obj.name}")
-            return call_function(fn, expr.args, expr.kwargs, env, out)
+            return call_function(fn, expr.args, expr.kwargs, env)
         raise RuntimeError(f"method {name} not supported on type {type(obj).__name__}")
     if isinstance(expr, BinOp):
-        left = eval_expr(expr.left, env, out)
-        right = eval_expr(expr.right, env, out)
+        left = eval_expr(expr.left, env)
+        right = eval_expr(expr.right, env)
         op = expr.op
 
-        # ---------- addition ----------
         if op == "+":
-            # string concat
             if isinstance(left, str) or isinstance(right, str):
                 return str(left) + str(right)
-
-            # list concat
             if isinstance(left, list) and isinstance(right, list):
                 return left + right
-
-            # numeric add
             if isinstance(left, int) and isinstance(right, int):
                 return left + right
-
             raise RuntimeError(f"unsupported + between {type(left).__name__} and {type(right).__name__}")
 
-        # ---------- subtraction ----------
         if op == "-":
             if isinstance(left, int) and isinstance(right, int):
                 return left - right
             raise RuntimeError(f"unsupported - between {type(left).__name__} and {type(right).__name__}")
 
-        # ---------- multiplication ----------
         if op == "*":
-            # int * int
             if isinstance(left, int) and isinstance(right, int):
                 return left * right
-
-            # string * int
             if isinstance(left, str) and isinstance(right, int):
                 return left * right
-
-            # list * int
             if isinstance(left, list) and isinstance(right, int):
                 return left * right
-
             raise RuntimeError(f"unsupported * between {type(left).__name__} and {type(right).__name__}")
 
-        # ---------- integer division ----------
         if op == "/":
             if isinstance(left, int) and isinstance(right, int):
                 return left // right
             raise RuntimeError(f"unsupported / between {type(left).__name__} and {type(right).__name__}")
 
-        # ---------- modulo ----------
         if op == "%":
             if isinstance(left, int) and isinstance(right, int):
                 return left % right
             raise RuntimeError(f"unsupported % between {type(left).__name__} and {type(right).__name__}")
 
-        # ---------- comparisons ----------
         if op in ("<", ">", "<=", ">=", "==", "!="):
-            if op == "<":
-                return left < right
-            if op == ">":
-                return left > right
-            if op == "<=":
-                return left <= right
-            if op == ">=":
-                return left >= right
-            if op == "==":
-                return left == right
-            if op == "!=":
-                return left != right
+            if op == "<": return left < right
+            if op == ">": return left > right
+            if op == "<=": return left <= right
+            if op == ">=": return left >= right
+            if op == "==": return left == right
+            if op == "!=": return left != right
 
         raise RuntimeError(f"unsupported operator {op}")
 
     if isinstance(expr, Call):
+
         if expr.name == "range":
             if len(expr.args) != 1 or expr.kwargs:
                 raise RuntimeError("range() supports exactly 1 positional arg here")
-            stop = eval_expr(expr.args[0], env, out)
+            stop = eval_expr(expr.args[0], env)
             return range(int(stop))
+
         if expr.name == "len":
             if len(expr.args) != 1 or expr.kwargs:
                 raise RuntimeError("len() needs 1 positional argument")
-            val = eval_expr(expr.args[0], env, out)
+            val = eval_expr(expr.args[0], env)
             try:
                 return len(val)
             except TypeError:
                 raise RuntimeError("object has no len()")
 
-        # functions or classes
+        if expr.name == "enumerate":
+            if expr.kwargs or len(expr.args) not in (1, 2):
+                raise RuntimeError("enumerate() takes 1 or 2 positional args and no kwargs")
+            seq = eval_expr(expr.args[0], env)
+            start = 0
+            if len(expr.args) == 2:
+                start = int(eval_expr(expr.args[1], env))
+            return list(enumerate(seq, start))
+
+        if expr.name == "zip":
+            if expr.kwargs or len(expr.args) < 1:
+                raise RuntimeError("zip() needs at least 1 positional arg and no kwargs")
+            iterables = [eval_expr(a, env) for a in expr.args]
+            return list(zip(*iterables))
+
+        # --------------------
+        # NEW BUILTIN: list()
+        # --------------------
+        if expr.name == "list":
+            if expr.kwargs:
+                raise RuntimeError("list() takes only positional arguments")
+            if len(expr.args) == 0:
+                return []
+            if len(expr.args) == 1:
+                it = eval_expr(expr.args[0], env)
+                try:
+                    return list(it)
+                except Exception:
+                    raise RuntimeError("object not iterable for list()")
+            raise RuntimeError("list() takes at most 1 argument")
+
+        # fallthrough to user-defined fn/class/var
         try:
             fn = env.get_func(expr.name)
-            return call_function(fn, expr.args, expr.kwargs, env, out)
+            return call_function(fn, expr.args, expr.kwargs, env)
         except NameError:
             pass
+
         try:
             cls = env.get_class(expr.name)
-            return call_class(cls, expr.args, expr.kwargs, env, out)
+            return call_class(cls, expr.args, expr.kwargs, env)
         except NameError:
             pass
+
         try:
             val = env.get_var(expr.name)
             if isinstance(val, FunctionObject):
-                return call_function(val, expr.args, expr.kwargs, env, out)
+                return call_function(val, expr.args, expr.kwargs, env)
             if isinstance(val, ClassObject):
-                return call_class(val, expr.args, expr.kwargs, env, out)
+                return call_class(val, expr.args, expr.kwargs, env)
         except NameError:
             pass
+
         raise NameError(f"undefined function or class or variable {expr.name}")
 
     raise RuntimeError("unknown expression")
@@ -1608,7 +1799,9 @@ def maybe_jit_compile(fn):
 # Callers (functions / methods / classes)
 # =========================
 
-def _invoke_function(fn, pos_values, kw_values, out):
+def _invoke_function(fn, pos_values, kw_values):
+    global CURRENT_OUT
+
     fn.call_count += 1
     if fn.call_count >= JIT_THRESHOLD and fn.jit_impl is None:
         maybe_jit_compile(fn)
@@ -1656,7 +1849,7 @@ def _invoke_function(fn, pos_values, kw_values, out):
                     f"type error in call to {fn.name}: param {name} expected {expected_type_name}, got {type(val).__name__}"
                 )
 
-    if fn.jit_impl is not None and fn.vararg is None and not defaults:
+    if fn.jit_impl is not None and fn.vararg is None and not defaults and not fn.is_async:
         ordered = [bindings[name] for name in param_names]
         return fn.jit_impl(*ordered)
 
@@ -1665,7 +1858,6 @@ def _invoke_function(fn, pos_values, kw_values, out):
         local.set_var(name, val)
     local.yield_values = []
 
-    # generator guard
     has_yield = False
     for stmt in fn.body:
         if isinstance(stmt, YieldStmt):
@@ -1674,10 +1866,10 @@ def _invoke_function(fn, pos_values, kw_values, out):
 
     try:
         if has_yield:
-            eval_block(fn.body, local, out)
+            eval_block(fn.body, local, CURRENT_OUT)
             return list(local.yield_values)
 
-        eval_block(fn.body, local, out)
+        eval_block(fn.body, local, CURRENT_OUT)
         return None
 
     except ReturnException as r:
@@ -1685,29 +1877,29 @@ def _invoke_function(fn, pos_values, kw_values, out):
             return list(local.yield_values)
         return r.value
 
-def call_function(fn, args_exprs, kwargs_exprs, env, out):
-    pos_values = [eval_expr(a, env, out) for a in args_exprs]
+def call_function(fn, args_exprs, kwargs_exprs, env):
+    pos_values = [eval_expr(a, env) for a in args_exprs]
     kw_values = {}
     for key, expr_arg in kwargs_exprs:
         if key in kw_values:
             raise RuntimeError(f"duplicate keyword argument {key} in call to {fn.name}")
-        kw_values[key] = eval_expr(expr_arg, env, out)
-    return _invoke_function(fn, pos_values, kw_values, out)
+        kw_values[key] = eval_expr(expr_arg, env)
+    return _invoke_function(fn, pos_values, kw_values)
 
-def call_method(instance, fn, args_exprs, kwargs_exprs, env, out):
-    pos_values = [instance] + [eval_expr(a, env, out) for a in args_exprs]
+def call_method(instance, fn, args_exprs, kwargs_exprs, env):
+    pos_values = [instance] + [eval_expr(a, env) for a in args_exprs]
     kw_values = {}
     for key, expr_arg in kwargs_exprs:
         if key in kw_values:
             raise RuntimeError(f"duplicate keyword argument {key} in call to {fn.name}")
-        kw_values[key] = eval_expr(expr_arg, env, out)
-    return _invoke_function(fn, pos_values, kw_values, out)
+        kw_values[key] = eval_expr(expr_arg, env)
+    return _invoke_function(fn, pos_values, kw_values)
 
-def call_class(cls, args_exprs, kwargs_exprs, env, out):
+def call_class(cls, args_exprs, kwargs_exprs, env):
     inst = InstanceObject(cls, fields=dict(cls.attributes))
     init = class_lookup_method(cls, "__init__")
     if init is not None:
-        call_method(inst, init, args_exprs, kwargs_exprs, env, out)
+        call_method(inst, init, args_exprs, kwargs_exprs, env)
     return inst
 
 # =========================
@@ -1715,6 +1907,7 @@ def call_class(cls, args_exprs, kwargs_exprs, env, out):
 # =========================
 
 def import_module(name, env):
+    global CURRENT_OUT
     if name in MODULE_CACHE:
         env.set_var(name, MODULE_CACHE[name])
         return
@@ -1728,7 +1921,10 @@ def import_module(name, env):
     prog = parser.parse_program()
     module_env = Env()
     module_out = []
+    prev_out = CURRENT_OUT
+    CURRENT_OUT = module_out
     eval_block(prog.stmts, module_env, module_out)
+    CURRENT_OUT = prev_out
     mod = ModuleObject(name, module_env)
     MODULE_CACHE[name] = mod
     env.set_var(name, mod)
@@ -1754,13 +1950,13 @@ def main():
     binfile = elf64(code, msg)
 
     os.makedirs("build", exist_ok=True)
-    out = "build/main"
-    open(out, "wb").write(binfile)
-    os.chmod(out, 0o755)
+    out_path = "build/main"
+    open(out_path, "wb").write(binfile)
+    os.chmod(out_path, 0o755)
 
-    proc = subprocess.run([out], capture_output=True, text=True)
+    proc = subprocess.run([out_path], capture_output=True, text=True)
     print(proc.stdout, end="")
     sys.exit(proc.returncode)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()

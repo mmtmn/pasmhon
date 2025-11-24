@@ -130,7 +130,7 @@ speedup: 73.20814812582314
 - [ ] dynamic introduction of variables  
 
 
-Phase 7: Standard Library Compatibility
+**Phase 7: Standard Library Compatibility**
 
 - [ ] builtins module  
 - [ ] sys module (partial)  

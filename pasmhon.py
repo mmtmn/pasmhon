@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-
 import sys, re, os, stat, subprocess
 from dataclasses import dataclass
 
 # =========================
-# ELF backend (same idea as before)
+# ELF backend
 # =========================
 
 BASE   = 0x400000
 CODEVA = BASE + 0x80
 DATAVA = BASE + 0x100
 
-def build_print(msg: bytes) -> bytes:
+def build_print(msg):
     code = []
     # write(1, msg, len)
     code += [0x48,0xc7,0xc0,1,0,0,0]                     # mov rax,1
@@ -25,14 +24,14 @@ def build_print(msg: bytes) -> bytes:
     code += [0x0f,0x05]                                  # syscall
     return bytes(code)
 
-def elf64(code: bytes, data: bytes) -> bytes:
+def elf64(code, data):
     # ELF header
     eh = bytearray()
-    eh += b"\x7fELF"          # magic
-    eh += b"\x02"             # 64 bit
-    eh += b"\x01"             # little endian
-    eh += b"\x01"             # version
-    eh += b"\x00"*9           # padding
+    eh += b"\x7fELF"
+    eh += b"\x02"
+    eh += b"\x01"
+    eh += b"\x01"
+    eh += b"\x00"*9
     eh += (2).to_bytes(2,'little')      # type EXEC
     eh += (0x3e).to_bytes(2,'little')   # machine x86_64
     eh += (1).to_bytes(4,'little')      # version
@@ -73,7 +72,7 @@ def elf64(code: bytes, data: bytes) -> bytes:
         blob += b"\x00"
 
     blob += data
-    return bytes(blob)
+    return blob
 
 # =========================
 # Lexer
@@ -91,7 +90,7 @@ KEYWORDS = {
     "return": "RETURN",
 }
 
-def tokenize(line: str):
+def lex_line(line):
     tokens = []
     i = 0
     n = len(line)
@@ -116,10 +115,8 @@ def tokenize(line: str):
             continue
         if c == '"':
             i += 1
-            start = i
             buf = []
             while i < n and line[i] != '"':
-                # bare minimum, no fancy escapes
                 buf.append(line[i])
                 i += 1
             if i >= n or line[i] != '"':
@@ -127,7 +124,6 @@ def tokenize(line: str):
             i += 1
             tokens.append(Token("STRING", "".join(buf)))
             continue
-        # multi char operators
         if c in "=!<>" and i + 1 < n and line[i+1] == "=":
             two = c + "="
             ttype = {
@@ -139,7 +135,6 @@ def tokenize(line: str):
             tokens.append(Token(ttype, two))
             i += 2
             continue
-        # single char tokens
         single = {
             "+": "PLUS",
             "-": "MINUS",
@@ -158,6 +153,31 @@ def tokenize(line: str):
             i += 1
             continue
         raise SyntaxError(f"unexpected character {c!r}")
+    return tokens
+
+def lex(src):
+    tokens = []
+    indents = [0]
+    for raw in src.splitlines():
+        line = raw.rstrip("\r\n")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        stripped = line.lstrip(" ")
+        indent = len(line) - len(stripped)
+        if indent > indents[-1]:
+            indents.append(indent)
+            tokens.append(Token("INDENT", None))
+        elif indent < indents[-1]:
+            while indent < indents[-1]:
+                indents.pop()
+                tokens.append(Token("DEDENT", None))
+            if indent != indents[-1]:
+                raise SyntaxError("inconsistent indentation")
+        tokens.extend(lex_line(stripped))
+        tokens.append(Token("NEWLINE", None))
+    while len(indents) > 1:
+        indents.pop()
+        tokens.append(Token("DEDENT", None))
     tokens.append(Token("EOF", None))
     return tokens
 
@@ -169,36 +189,34 @@ def tokenize(line: str):
 class Program:
     stmts: list
 
-# statements
 @dataclass
 class Assign:
     name: str
     expr: object
 
 @dataclass
-class Print:
+class PrintStmt:
     expr: object
 
 @dataclass
-class If:
+class IfStmt:
     cond: object
-    body: object
+    body: list
 
 @dataclass
 class FuncDef:
     name: str
-    param: str
-    body: object
+    param: object
+    body: list
 
 @dataclass
-class Return:
+class ReturnStmt:
     expr: object
 
 @dataclass
 class ExprStmt:
     expr: object
 
-# expressions
 @dataclass
 class IntLit:
     value: int
@@ -220,10 +238,10 @@ class BinOp:
 @dataclass
 class Call:
     name: str
-    arg: object | None
+    arg: object
 
 # =========================
-# Parser (recursive descent)
+# Parser
 # =========================
 
 class Parser:
@@ -235,35 +253,39 @@ class Parser:
     def cur(self):
         return self.tokens[self.i]
 
+    def peek(self):
+        return self.tokens[self.i+1]
+
     def eat(self, ttype):
         if self.cur.type != ttype:
             raise SyntaxError(f"expected {ttype}, got {self.cur.type}")
         self.i += 1
 
-    def parse_program(self, src: str) -> Program:
-        lines = [ln.strip() for ln in src.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    def parse_program(self):
         stmts = []
-        for ln in lines:
-            self.tokens = tokenize(ln)
-            self.i = 0
+        while self.cur.type != "EOF":
+            if self.cur.type in ("NEWLINE", "DEDENT"):
+                self.eat(self.cur.type)
+                continue
             stmts.append(self.parse_stmt())
-            if self.cur.type != "EOF":
-                raise SyntaxError("extra tokens at end of line")
         return Program(stmts)
 
     def parse_stmt(self):
-        if self.cur.type == "DEF":
-            return self.parse_funcdef()
         if self.cur.type == "IF":
             return self.parse_if()
-        if self.cur.type == "RETURN":
-            return self.parse_return()
-        return self.parse_simple_stmt()
+        if self.cur.type == "DEF":
+            return self.parse_funcdef()
+        node = self.parse_simple_stmt()
+        if self.cur.type == "NEWLINE":
+            self.eat("NEWLINE")
+        return node
 
     def parse_simple_stmt(self):
         if self.cur.type == "PRINT":
             return self.parse_print()
-        if self.cur.type == "IDENT" and self.tokens[self.i+1].type == "EQ":
+        if self.cur.type == "RETURN":
+            return self.parse_return()
+        if self.cur.type == "IDENT" and self.peek().type == "EQ":
             return self.parse_assign()
         expr = self.parse_expr()
         return ExprStmt(expr)
@@ -273,7 +295,7 @@ class Parser:
         self.eat("LPAREN")
         expr = self.parse_expr()
         self.eat("RPAREN")
-        return Print(expr)
+        return PrintStmt(expr)
 
     def parse_assign(self):
         name = self.cur.value
@@ -284,10 +306,27 @@ class Parser:
 
     def parse_if(self):
         self.eat("IF")
-        cond = self.parse_expr()
+        cond_tokens = []
+        while self.cur.type not in ("COLON", "EOF"):
+            cond_tokens.append(self.cur)
+            self.i += 1
+        if self.cur.type != "COLON":
+            raise SyntaxError("expected ':' after if condition")
         self.eat("COLON")
-        body = self.parse_simple_stmt()
-        return If(cond, body)
+        cond_parser = Parser(cond_tokens + [Token("EOF", None)])
+        cond = cond_parser.parse_expr()
+        body = []
+        if self.cur.type == "NEWLINE":
+            self.eat("NEWLINE")
+            self.eat("INDENT")
+            while self.cur.type not in ("DEDENT", "EOF"):
+                body.append(self.parse_stmt())
+            self.eat("DEDENT")
+        else:
+            body.append(self.parse_simple_stmt())
+            if self.cur.type == "NEWLINE":
+                self.eat("NEWLINE")
+        return IfStmt(cond, body)
 
     def parse_funcdef(self):
         self.eat("DEF")
@@ -296,21 +335,30 @@ class Parser:
         name = self.cur.value
         self.eat("IDENT")
         self.eat("LPAREN")
-        if self.cur.type != "IDENT":
-            raise SyntaxError("expected parameter name")
-        param = self.cur.value
-        self.eat("IDENT")
+        param = None
+        if self.cur.type == "IDENT":
+            param = self.cur.value
+            self.eat("IDENT")
         self.eat("RPAREN")
         self.eat("COLON")
-        body = self.parse_simple_stmt()
+        body = []
+        if self.cur.type == "NEWLINE":
+            self.eat("NEWLINE")
+            self.eat("INDENT")
+            while self.cur.type not in ("DEDENT", "EOF"):
+                body.append(self.parse_stmt())
+            self.eat("DEDENT")
+        else:
+            body.append(self.parse_simple_stmt())
+            if self.cur.type == "NEWLINE":
+                self.eat("NEWLINE")
         return FuncDef(name, param, body)
 
     def parse_return(self):
         self.eat("RETURN")
         expr = self.parse_expr()
-        return Return(expr)
+        return ReturnStmt(expr)
 
-    # expression grammar
     def parse_expr(self):
         return self.parse_equality()
 
@@ -378,7 +426,6 @@ class Parser:
             name = tok.value
             self.eat("IDENT")
             if self.cur.type == "LPAREN":
-                # simple function call, zero or one argument
                 self.eat("LPAREN")
                 if self.cur.type == "RPAREN":
                     self.eat("RPAREN")
@@ -395,7 +442,7 @@ class Parser:
         raise SyntaxError(f"unexpected token {tok.type}")
 
 # =========================
-# Interpreter over AST
+# Interpreter
 # =========================
 
 class ReturnException(Exception):
@@ -431,32 +478,35 @@ class Env:
 @dataclass
 class FunctionObject:
     name: str
-    param: str
-    body: object
+    param: object
+    body: list
     env: Env
 
-def eval_program(prog: Program) -> str:
+def eval_block(stmts, env, out):
+    for s in stmts:
+        eval_stmt(s, env, out)
+
+def eval_program(prog):
     env = Env()
     out = []
-    for stmt in prog.stmts:
-        eval_stmt(stmt, env, out)
+    eval_block(prog.stmts, env, out)
     return "".join(out)
 
-def eval_stmt(stmt, env: Env, out: list):
+def eval_stmt(stmt, env, out):
     if isinstance(stmt, Assign):
         val = eval_expr(stmt.expr, env)
         env.set_var(stmt.name, val)
-    elif isinstance(stmt, Print):
+    elif isinstance(stmt, PrintStmt):
         val = eval_expr(stmt.expr, env)
         out.append(str(val) + "\n")
-    elif isinstance(stmt, If):
+    elif isinstance(stmt, IfStmt):
         cond = eval_expr(stmt.cond, env)
         if bool(cond):
-            eval_stmt(stmt.body, env, out)
+            eval_block(stmt.body, env, out)
     elif isinstance(stmt, FuncDef):
         fn = FunctionObject(stmt.name, stmt.param, stmt.body, env)
         env.set_func(stmt.name, fn)
-    elif isinstance(stmt, Return):
+    elif isinstance(stmt, ReturnStmt):
         val = eval_expr(stmt.expr, env)
         raise ReturnException(val)
     elif isinstance(stmt, ExprStmt):
@@ -464,7 +514,7 @@ def eval_stmt(stmt, env: Env, out: list):
     else:
         raise RuntimeError("unknown statement")
 
-def eval_expr(expr, env: Env):
+def eval_expr(expr, env):
     if isinstance(expr, IntLit):
         return expr.value
     if isinstance(expr, StringLit):
@@ -477,7 +527,6 @@ def eval_expr(expr, env: Env):
         op = expr.op
         if op in ("+", "-", "*", "/"):
             if op == "+":
-                # allow int plus int, or string concat
                 if isinstance(left, str) or isinstance(right, str):
                     return str(left) + str(right)
                 return int(left) + int(right)
@@ -507,52 +556,44 @@ def eval_expr(expr, env: Env):
         if fn.param is not None:
             if expr.arg is not None:
                 arg_val = eval_expr(expr.arg, env)
-                local.set_var(fn.param, arg_val)
             else:
-                local.set_var(fn.param, None)
+                arg_val = None
+            local.set_var(fn.param, arg_val)
         try:
-            eval_stmt(fn.body, local, out=[])
+            eval_block(fn.body, local, out=[])
             return None
         except ReturnException as r:
             return r.value
     raise RuntimeError("unknown expression")
 
 # =========================
-# pasmhon main
+# Main
 # =========================
 
 def main():
     if len(sys.argv) != 2:
-        print("usage: pasmhon main.pa")
+        print("usage: pathon main.pa")
         sys.exit(1)
 
     src = open(sys.argv[1]).read()
+    tokens = lex(src)
+    parser = Parser(tokens)
+    prog = parser.parse_program()
 
-    # front end: parse to AST
-    parser = Parser([])
-    prog = parser.parse_program(src)
-
-    # run at compile time to compute full output string
     out_text = eval_program(prog)
-    msg = out_text.encode("utf8")
+    msg = out_text.encode()
 
-    # backend: emit native code that just writes this output
     code = build_print(msg)
     binfile = elf64(code, msg)
 
     os.makedirs("build", exist_ok=True)
-    out_path = "build/main"
-    with open(out_path, "wb") as f:
-        f.write(binfile)
-    os.chmod(out_path, os.stat(out_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    out = "build/main"
+    open(out, "wb").write(binfile)
+    os.chmod(out, 0o755)
 
-    # run the compiled binary so pasmhon behaves like python3
-    proc = subprocess.run([out_path], text=True, capture_output=True)
-    if proc.stdout:
-        print(proc.stdout, end="")
-    if proc.stderr:
-        print(proc.stderr, end="", file=sys.stderr)
+    proc = subprocess.run([out], capture_output=True, text=True)
+    print(proc.stdout, end="")
     sys.exit(proc.returncode)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()

@@ -31,4 +31,6 @@ roadmap:
 - [x] functions
 - [x] conditions
 - [x] if statements
-- [ ] loops 
+- [x] loops
+- [ ] lists and dictionaries 
+- [ ] oop

@@ -165,5 +165,5 @@ speedup: 73.20814812582314
 
 # but why?
 
-- the intent is to go one language at a time, with the intent of a universal compiler
+- the intent is to go one language at a time, with the intent of a universal assembly compiler
 - asm is my **favorite** programming language and this is my way of having fun

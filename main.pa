@@ -1,2 +1,12 @@
+print("hello world")
+
 x = 3 + 7
 print(x)
+
+if x < 15:
+    print("small")
+
+def f(n):
+    return n * 2
+
+print(f(x))

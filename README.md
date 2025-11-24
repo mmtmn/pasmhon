@@ -52,11 +52,17 @@ speedup: 73.20814812582314
 - [x] comprehensions
 - [x] yield
 - [ ] generator expressions
-- [ ] async await (if you’re masochistic)
+- [ ] async await (heh, this won't be easy)
 - [ ] with statements
 - [ ] enumerate zip and friends
 - [ ] real slicing semantics
 - [ ] unicode rules
+- [ ] real slicing semantics
+- [ ] unicode
+- [ ] with statements
+- [ ] multiple inheritance with proper MRO
+- [ ] magic methods
+
 
 # how to:
 

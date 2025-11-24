@@ -152,6 +152,11 @@ def lex_line(line):
             "<": "LT",
             ">": "GT",
             "=": "EQ",
+            "[": "LBRACK",
+            "]": "RBRACK",
+            "{": "LBRACE",
+            "}": "RBRACE",
+            ".": "DOT",
         }
         if c in single:
             tokens.append(Token(single[c], c))
@@ -261,6 +266,25 @@ class BinOp:
 
 @dataclass
 class Call:
+    name: str
+    arg: object
+
+@dataclass
+class ListLit:
+    elements: list
+
+@dataclass
+class DictLit:
+    items: list   # list of (key_expr, value_expr)
+
+@dataclass
+class Index:
+    seq: object
+    index: object
+
+@dataclass
+class MethodCall:
+    obj: object
     name: str
     arg: object
 
@@ -503,7 +527,39 @@ class Parser:
             return BinOp("*", IntLit(-1), expr)
         return self.parse_primary()
 
-    def parse_primary(self):
+    def parse_list_lit(self):
+        self.eat("LBRACK")
+        elements = []
+        if self.cur.type != "RBRACK":
+            elements.append(self.parse_expr())
+            while self.cur.type == "COMMA":
+                self.eat("COMMA")
+                if self.cur.type == "RBRACK":
+                    break
+                elements.append(self.parse_expr())
+        self.eat("RBRACK")
+        return ListLit(elements)
+
+    def parse_dict_lit(self):
+        self.eat("LBRACE")
+        items = []
+        if self.cur.type != "RBRACE":
+            key = self.parse_expr()
+            self.eat("COLON")
+            value = self.parse_expr()
+            items.append((key, value))
+            while self.cur.type == "COMMA":
+                self.eat("COMMA")
+                if self.cur.type == "RBRACE":
+                    break
+                key = self.parse_expr()
+                self.eat("COLON")
+                value = self.parse_expr()
+                items.append((key, value))
+        self.eat("RBRACE")
+        return DictLit(items)
+
+    def parse_atom(self):
         tok = self.cur
         if tok.type == "INT":
             self.eat("INT")
@@ -528,7 +584,35 @@ class Parser:
             expr = self.parse_expr()
             self.eat("RPAREN")
             return expr
+        if tok.type == "LBRACK":
+            return self.parse_list_lit()
+        if tok.type == "LBRACE":
+            return self.parse_dict_lit()
         raise SyntaxError(f"unexpected token {tok.type}")
+
+    def parse_primary(self):
+        node = self.parse_atom()
+        while True:
+            if self.cur.type == "DOT":
+                self.eat("DOT")
+                if self.cur.type != "IDENT":
+                    raise SyntaxError("expected method name after '.'")
+                method_name = self.cur.value
+                self.eat("IDENT")
+                self.eat("LPAREN")
+                arg = None
+                if self.cur.type != "RPAREN":
+                    arg = self.parse_expr()
+                self.eat("RPAREN")
+                node = MethodCall(node, method_name, arg)
+            elif self.cur.type == "LBRACK":
+                self.eat("LBRACK")
+                index_expr = self.parse_expr()
+                self.eat("RBRACK")
+                node = Index(node, index_expr)
+            else:
+                break
+        return node
 
 # =========================
 # Interpreter
@@ -640,8 +724,51 @@ def eval_expr(expr, env):
         return expr.value
     if isinstance(expr, StringLit):
         return expr.value
+    if isinstance(expr, ListLit):
+        return [eval_expr(e, env) for e in expr.elements]
+    if isinstance(expr, DictLit):
+        d = {}
+        for k_expr, v_expr in expr.items:
+            k = eval_expr(k_expr, env)
+            v = eval_expr(v_expr, env)
+            d[k] = v
+        return d
     if isinstance(expr, Var):
         return env.get_var(expr.name)
+    if isinstance(expr, Index):
+        seq_val = eval_expr(expr.seq, env)
+        idx_val = eval_expr(expr.index, env)
+        try:
+            return seq_val[idx_val]
+        except Exception as e:
+            raise RuntimeError(f"index error: {e}")
+    if isinstance(expr, MethodCall):
+        obj = eval_expr(expr.obj, env)
+        arg_val = eval_expr(expr.arg, env) if expr.arg is not None else None
+        name = expr.name
+        if isinstance(obj, list):
+            if name == "append":
+                obj.append(arg_val)
+                return None
+            if name == "pop":
+                if expr.arg is None:
+                    return obj.pop()
+                return obj.pop(arg_val)
+            if name == "sort":
+                obj.sort()
+                return None
+            raise RuntimeError(f"unsupported list method {name}")
+        if isinstance(obj, dict):
+            if name == "keys":
+                return list(obj.keys())
+            if name == "values":
+                return list(obj.values())
+            if name == "items":
+                return list(obj.items())
+            if name == "get":
+                return obj.get(arg_val)
+            raise RuntimeError(f"unsupported dict method {name}")
+        raise RuntimeError(f"method {name} not supported on type {type(obj).__name__}")
     if isinstance(expr, BinOp):
         left = eval_expr(expr.left, env)
         right = eval_expr(expr.right, env)
@@ -677,6 +804,14 @@ def eval_expr(expr, env):
                 raise RuntimeError("range() needs 1 argument for now")
             stop = eval_expr(expr.arg, env)
             return range(int(stop))
+        if expr.name == "len":
+            if expr.arg is None:
+                raise RuntimeError("len() needs 1 argument")
+            val = eval_expr(expr.arg, env)
+            try:
+                return len(val)
+            except TypeError:
+                raise RuntimeError("object has no len()")
         fn = env.get_func(expr.name)
         local = Env(parent=fn.env)
         if fn.param is not None:

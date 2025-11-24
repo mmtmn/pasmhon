@@ -28,7 +28,7 @@ speedup: 73.20814812582314
 
 - [x] print
 - [x] variables
-- [x] simbols (+, -, /, %)
+- [x] math
 - [x] functions
 - [x] conditions
 - [x] if statements

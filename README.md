@@ -44,7 +44,27 @@ speedup: 73.20814812582314
 - [x] jit
 - [x] static typing
 - [x] single line comments
-- [x] multi line comments 
+- [x] multi line comments
+- [ ] keyword arguments
+- [ ] default args
+- [ ] variable args
+- [ ] list comprehensions
+- [ ] dict comprehensions
+- [ ] lambdas
+- [ ] generator expressions
+- [ ] generators with yield
+- [ ] async and await
+- [ ] with statements
+- [ ] multiple inheritance
+- [ ] MRO resolution
+- [ ] descriptors
+- [ ] metaclasses
+- [ ] operator overloading
+- [ ] magic methods
+- [ ] real exceptions with types
+- [ ] builtins like enumerate and zip
+- [ ] full slicing semantics
+- [ ] unicode rules
 
 # how to:
 

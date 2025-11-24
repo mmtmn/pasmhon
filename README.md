@@ -23,3 +23,9 @@ pasmhon : avg 102.8 us   std 22.7 us
 
 speedup: 73.20814812582314
 ```
+
+roadmap:
+- [x] print
+- [x] variables
+- [x] simbols (+, -, /, %)
+- [ ] functions

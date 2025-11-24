@@ -45,6 +45,12 @@ speedup: 73.20814812582314
 - [x] static typing
 - [x] single line comments
 - [x] multi line comments
+- [ ] kwargs
+- [ ] defaults
+- [ ] varargs
+- [ ] lambdas
+- [ ] comprehensions
+- [ ] yield
 - [ ] keyword arguments
 - [ ] default args
 - [ ] variable args

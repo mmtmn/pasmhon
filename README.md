@@ -27,7 +27,7 @@ speedup: 73.20814812582314
 # roadmap:
 
 
-## Phase 1 — Core Language Features
+Phase 1: Core Language Features
 
 - [x] print
 - [x] variables
@@ -61,7 +61,7 @@ speedup: 73.20814812582314
 - [ ] real slicing semantics (full Python behavior)
 - [ ] unicode correctness (parsing + string ops)
 
-## Phase 2 — Advanced Language Constructs
+Phase 2: Advanced Language Constructs
 
 - [ ] multiple inheritance
 - [ ] C3 linearization (real MRO)
@@ -69,7 +69,7 @@ speedup: 73.20814812582314
 - [ ] super()
 - [ ] class attributes vs instance attributes parity
 
-## Phase 3 — Python Data Model
+Phase 3: Python Data Model
 
 - [ ] descriptor protocol  
   - __get__  
@@ -91,7 +91,7 @@ speedup: 73.20814812582314
 - [ ] __call__
 - [ ] __str__, __repr__
 
-## Phase 4 — Exceptions and Types
+Phase 4: Exceptions and Types
 
 - [ ] real exception classes  
 - [ ] exception hierarchy  
@@ -99,7 +99,7 @@ speedup: 73.20814812582314
 - [ ] raise from  
 - [ ] traceback object model (optional but real Python has it)
 
-## Phase 5 — Full Class System
+Phase 5: Full Class System
 
 - [ ] metaclasses  
 - [ ] type as a class  
@@ -113,7 +113,7 @@ speedup: 73.20814812582314
 - [ ] @property  
 - [ ] classmethod / staticmethod (descriptor-based)
 
-## Phase 6 — Runtime and Execution Semantics
+Phase 6: Runtime and Execution Semantics
 
 - [ ] proper generators (stack suspension)  
 - [ ] send(), throw(), close()  
@@ -124,7 +124,7 @@ speedup: 73.20814812582314
 - [ ] eval() and exec()  
 - [ ] dynamic introduction of variables  
 
-## Phase 7 — Standard Library Compatibility
+Phase 7: Standard Library Compatibility
 
 - [ ] builtins module  
 - [ ] sys module (partial)  
@@ -133,14 +133,14 @@ speedup: 73.20814812582314
 - [ ] circular imports  
 - [ ] relative imports  
 
-## Phase 8 — Performance + Memory Model
+Phase 8: Performance + Memory Model
 
 - [ ] reference counting  
 - [ ] cyclic GC  
 - [ ] weakrefs  
 - [ ] object finalization rules  
 
-## Phase 9 — Assembly + Native Code Polish
+Phase 9: Assembly + Native Code Polish
 
 - [ ] fast path for numeric ops  
 - [ ] inline caches for attribute lookup  

@@ -33,7 +33,7 @@ speedup: 73.20814812582314
 - [x] conditions
 - [x] if statements
 - [x] loops
-- [ ] lists and dictionaries 
+- [x] lists and dictionaries 
 - [ ] oop
 
 # how to:

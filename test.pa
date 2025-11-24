@@ -99,3 +99,9 @@ while i < 20:
     i = i + 1
 
 print(add(10, 20))
+
+# single line comment
+
+/*
+multi line comment
+*/

@@ -100,8 +100,73 @@ while i < 20:
 
 print(add(10, 20))
 
-# single line comment
 
-/*
-multi line comment
-*/
+def greet(name, msg="hello"):
+    return msg + " " + name
+
+print(greet("bob"))
+print(greet("bob", "hi"))
+
+def area(w, h):
+    return w * h
+
+print(area(h=3, w=5))
+
+def collect(a, *rest):
+    return [a] + rest
+
+print(collect(1))
+print(collect(1,2,3,4))
+
+square = lambda x: x * x
+print(square(5))
+
+adder = lambda a,b: a+b
+print(adder(10, 20))
+
+lc = [n*n for n in [1,2,3,4] if n % 2 == 0]
+print(lc)
+
+dc = { n: n*n for n in [1,2,3,4] if n > 2 }
+print(dc)
+
+def mix(a,b,c=100,d=200):
+    return a+b+c+d
+
+print(mix(1,2))
+print(mix(1,2,3))
+print(mix(1,2,3,4))
+print(mix(1,b=2,d=9))
+
+def gen_test(x):
+    yield x
+    yield x + 1
+    yield x * 2
+
+
+def gen_empty():
+    return 7
+
+print(gen_empty())
+
+def gen_loop(n):
+    i = 0
+    while i < n:
+        yield i * 10
+        i = i + 1
+
+print(gen_loop(4))
+
+vals = []
+for i in range(4):
+    f = lambda x=i: x * 10
+    vals.append(f())
+
+print(vals)
+
+xx = [ (n+1)*2 for n in [5,6,7] ]
+print(xx)
+
+yy = { k: k+10 for k in [10,20,30] }
+print(yy)
+

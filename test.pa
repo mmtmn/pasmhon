@@ -32,3 +32,70 @@ m = {"a": 1, "b": 2}
 print(m["a"])
 print(len(nums))
 print(m.keys())
+
+class Person:
+    def __init__(self, name: str, age: int):
+        self.name = name
+        self.age  = age
+
+    def birthday(self):
+        self.age = self.age + 1
+
+    def greet(self):
+        print("hi, I am " + self.name)
+
+p = Person("alice", 30)
+p.greet()
+p.birthday()
+print(p.age)
+
+class Animal:
+    def speak(self):
+        print("???")
+
+class Dog(Animal):
+    def speak(self):
+        print("woof")
+
+d = Dog()
+d.speak()
+
+try:
+    raise "bad"
+    print("should not run")
+except:
+    print("caught error")
+
+a = [10, 20, 30, 40, 50]
+print(a[1:4])
+print(a[:3])
+print(a[2:])
+print(a[::2])
+
+def make_counter():
+    x = 0
+    def inc():
+        nonlocal x
+        x = x + 1
+        return x
+    return inc
+
+counter = make_counter()
+print(counter())
+print(counter())
+print(counter())
+
+import foo
+foo.hi()
+
+def add(a: int, b: int):
+    return a + b
+
+print(add(3, 4))
+
+i = 0
+while i < 20:
+    add(i, i)
+    i = i + 1
+
+print(add(10, 20))

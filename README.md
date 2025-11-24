@@ -19,7 +19,7 @@ results per execution:
 
 python3: avg 7523.9 us   std 991.9 us
 
-pasmhon : avg 102.8 us   std 22.7 us
+pasmhon: avg 102.8 us   std 22.7 us
 
 speedup: 73.20814812582314
 ```

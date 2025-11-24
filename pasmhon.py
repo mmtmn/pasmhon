@@ -75,6 +75,20 @@ def elf64(code, data):
     return blob
 
 # =========================
+# Global config for types / JIT / imports
+# =========================
+
+TYPE_MAP = {
+    "int": int,
+    "str": str,
+    "list": list,
+    "dict": dict,
+}
+
+JIT_THRESHOLD = 10
+MODULE_CACHE = {}
+
+# =========================
 # Lexer
 # =========================
 
@@ -84,16 +98,21 @@ class Token:
     value: object
 
 KEYWORDS = {
-    "print": "PRINT",
-    "if": "IF",
-    "def": "DEF",
-    "return": "RETURN",
-    "while": "WHILE",
-    "for": "FOR",
-    "in": "IN",
-    "break": "BREAK",
+    "print":    "PRINT",
+    "if":       "IF",
+    "def":      "DEF",
+    "return":   "RETURN",
+    "while":    "WHILE",
+    "for":      "FOR",
+    "in":       "IN",
+    "break":    "BREAK",
     "continue": "CONTINUE",
-    "class": "CLASS",
+    "class":    "CLASS",
+    "try":      "TRY",
+    "except":   "EXCEPT",
+    "raise":    "RAISE",
+    "nonlocal": "NONLOCAL",
+    "import":   "IMPORT",
 }
 
 def lex_line(line):
@@ -241,12 +260,14 @@ class ForStmt:
 @dataclass
 class ClassDef:
     name: str
+    base_name: str | None
     body: list
 
 @dataclass
 class FuncDef:
     name: str
     params: list
+    annotations: dict
     body: list
 
 @dataclass
@@ -264,6 +285,23 @@ class ContinueStmt:
 @dataclass
 class ExprStmt:
     expr: object
+
+@dataclass
+class TryStmt:
+    body: list
+    handler: list
+
+@dataclass
+class RaiseStmt:
+    expr: object
+
+@dataclass
+class NonlocalStmt:
+    names: list
+
+@dataclass
+class ImportStmt:
+    module: str
 
 # expressions
 @dataclass
@@ -296,6 +334,13 @@ class DictLit:
 class Index:
     seq: object
     index: object
+
+@dataclass
+class SliceIndex:
+    seq: object
+    start: object | None
+    stop: object | None
+    step: object | None
 
 @dataclass
 class Attr:
@@ -346,6 +391,10 @@ class Parser:
     def parse_stmt(self):
         if self.cur.type == "CLASS":
             return self.parse_classdef()
+        if self.cur.type == "TRY":
+            return self.parse_try()
+        if self.cur.type == "IMPORT":
+            return self.parse_import()
         if self.cur.type == "IF":
             return self.parse_if()
         if self.cur.type == "WHILE":
@@ -370,6 +419,10 @@ class Parser:
         if self.cur.type == "CONTINUE":
             self.eat("CONTINUE")
             return ContinueStmt()
+        if self.cur.type == "NONLOCAL":
+            return self.parse_nonlocal()
+        if self.cur.type == "RAISE":
+            return self.parse_raise()
 
         expr = self.parse_expr()
         if self.cur.type == "EQ" and isinstance(expr, (Var, Attr, Index)):
@@ -396,6 +449,14 @@ class Parser:
             raise SyntaxError("expected class name")
         name = self.cur.value
         self.eat("IDENT")
+        base_name = None
+        if self.cur.type == "LPAREN":
+            self.eat("LPAREN")
+            if self.cur.type != "IDENT":
+                raise SyntaxError("expected base class name")
+            base_name = self.cur.value
+            self.eat("IDENT")
+            self.eat("RPAREN")
         self.eat("COLON")
         body = []
         if self.cur.type == "NEWLINE":
@@ -408,7 +469,66 @@ class Parser:
             body.append(self.parse_simple_stmt())
             if self.cur.type == "NEWLINE":
                 self.eat("NEWLINE")
-        return ClassDef(name, body)
+        return ClassDef(name, base_name, body)
+
+    def parse_try(self):
+        self.eat("TRY")
+        self.eat("COLON")
+        body = []
+        if self.cur.type == "NEWLINE":
+            self.eat("NEWLINE")
+            self.eat("INDENT")
+            while self.cur.type not in ("DEDENT", "EOF"):
+                body.append(self.parse_stmt())
+            self.eat("DEDENT")
+        else:
+            body.append(self.parse_simple_stmt())
+            if self.cur.type == "NEWLINE":
+                self.eat("NEWLINE")
+        if self.cur.type != "EXCEPT":
+            raise SyntaxError("expected 'except' after try block")
+        self.eat("EXCEPT")
+        self.eat("COLON")
+        handler = []
+        if self.cur.type == "NEWLINE":
+            self.eat("NEWLINE")
+            self.eat("INDENT")
+            while self.cur.type not in ("DEDENT", "EOF"):
+                handler.append(self.parse_stmt())
+            self.eat("DEDENT")
+        else:
+            handler.append(self.parse_simple_stmt())
+            if self.cur.type == "NEWLINE":
+                self.eat("NEWLINE")
+        return TryStmt(body, handler)
+
+    def parse_raise(self):
+        self.eat("RAISE")
+        expr = self.parse_expr()
+        return RaiseStmt(expr)
+
+    def parse_nonlocal(self):
+        self.eat("NONLOCAL")
+        names = []
+        if self.cur.type != "IDENT":
+            raise SyntaxError("expected name after nonlocal")
+        names.append(self.cur.value)
+        self.eat("IDENT")
+        while self.cur.type == "COMMA":
+            self.eat("COMMA")
+            if self.cur.type != "IDENT":
+                raise SyntaxError("expected name after nonlocal ','")
+            names.append(self.cur.value)
+            self.eat("IDENT")
+        return NonlocalStmt(names)
+
+    def parse_import(self):
+        self.eat("IMPORT")
+        if self.cur.type != "IDENT":
+            raise SyntaxError("expected module name")
+        name = self.cur.value
+        self.eat("IDENT")
+        return ImportStmt(name)
 
     def parse_if(self):
         self.eat("IF")
@@ -497,15 +617,26 @@ class Parser:
         self.eat("IDENT")
         self.eat("LPAREN")
         params = []
+        annotations = {}
         if self.cur.type == "IDENT":
-            params.append(self.cur.value)
-            self.eat("IDENT")
-            while self.cur.type == "COMMA":
+            while True:
+                pname = self.cur.value
+                self.eat("IDENT")
+                ptype = None
+                if self.cur.type == "COLON":
+                    self.eat("COLON")
+                    if self.cur.type != "IDENT":
+                        raise SyntaxError("expected type name")
+                    ptype = self.cur.value
+                    self.eat("IDENT")
+                params.append(pname)
+                if ptype is not None:
+                    annotations[pname] = ptype
+                if self.cur.type != "COMMA":
+                    break
                 self.eat("COMMA")
                 if self.cur.type != "IDENT":
                     raise SyntaxError("expected parameter name")
-                params.append(self.cur.value)
-                self.eat("IDENT")
         self.eat("RPAREN")
         self.eat("COLON")
         body = []
@@ -519,7 +650,7 @@ class Parser:
             body.append(self.parse_simple_stmt())
             if self.cur.type == "NEWLINE":
                 self.eat("NEWLINE")
-        return FuncDef(name, params, body)
+        return FuncDef(name, params, annotations, body)
 
     def parse_return(self):
         self.eat("RETURN")
@@ -673,12 +804,62 @@ class Parser:
                     node = Attr(node, name)
             elif self.cur.type == "LBRACK":
                 self.eat("LBRACK")
-                idx = self.parse_expr()
-                self.eat("RBRACK")
-                node = Index(node, idx)
+                # slice or index
+                if self.cur.type == "COLON":
+                    start = None
+                else:
+                    start = self.parse_expr()
+                if self.cur.type == "COLON":
+                    self.eat("COLON")
+                    if self.cur.type in ("RBRACK", "COLON"):
+                        stop = None
+                    else:
+                        stop = self.parse_expr()
+                    step = None
+                    if self.cur.type == "COLON":
+                        self.eat("COLON")
+                        if self.cur.type == "RBRACK":
+                            step = None
+                        else:
+                            step = self.parse_expr()
+                    self.eat("RBRACK")
+                    node = SliceIndex(node, start, stop, step)
+                else:
+                    self.eat("RBRACK")
+                    node = Index(node, start)
             else:
                 break
         return node
+
+# =========================
+# Bytecode VM
+# =========================
+
+@dataclass
+class Instruction:
+    op: str
+    arg: object = None
+
+def compile_program_to_bytecode(prog):
+    instrs = []
+    for stmt in prog.stmts:
+        instrs.append(Instruction("EXEC_STMT", stmt))
+    instrs.append(Instruction("HALT", None))
+    return instrs
+
+def run_bytecode(instrs, env):
+    out = []
+    ip = 0
+    while ip < len(instrs):
+        ins = instrs[ip]
+        if ins.op == "EXEC_STMT":
+            eval_stmt(ins.arg, env, out)
+            ip += 1
+        elif ins.op == "HALT":
+            break
+        else:
+            raise RuntimeError(f"unknown opcode {ins.op}")
+    return "".join(out)
 
 # =========================
 # Interpreter
@@ -694,12 +875,17 @@ class BreakException(Exception):
 class ContinueException(Exception):
     pass
 
+class LangException(Exception):
+    def __init__(self, value):
+        self.value = value
+
 class Env:
     def __init__(self, parent=None):
         self.vars = {}
         self.funcs = {}
         self.classes = {}
         self.parent = parent
+        self.nonlocal_vars = set()
 
     def get_var(self, name):
         if name in self.vars:
@@ -708,8 +894,22 @@ class Env:
             return self.parent.get_var(name)
         raise NameError(f"undefined variable {name}")
 
+    def _set_nonlocal(self, name, value):
+        if self.parent is None:
+            raise NameError(f"no binding for nonlocal {name}")
+        if name in self.parent.vars:
+            self.parent.vars[name] = value
+        else:
+            self.parent._set_nonlocal(name, value)
+
     def set_var(self, name, value):
-        self.vars[name] = value
+        if name in self.nonlocal_vars:
+            self._set_nonlocal(name, value)
+        else:
+            self.vars[name] = value
+
+    def declare_nonlocal(self, name):
+        self.nonlocal_vars.add(name)
 
     def get_func(self, name):
         if name in self.funcs:
@@ -738,17 +938,42 @@ class FunctionObject:
     body: list
     env: Env
     is_method: bool = False
+    annotations: dict | None = None
+    call_count: int = 0
+    jit_impl: object | None = None
 
 @dataclass
 class ClassObject:
     name: str
     methods: dict
     attributes: dict
+    base: "ClassObject | None" = None
 
 @dataclass
 class InstanceObject:
     cls: ClassObject
     fields: dict
+
+@dataclass
+class ModuleObject:
+    name: str
+    env: Env
+
+def class_lookup_attr(cls, name):
+    c = cls
+    while c is not None:
+        if name in c.attributes:
+            return c.attributes[name]
+        c = c.base
+    return None
+
+def class_lookup_method(cls, name):
+    c = cls
+    while c is not None:
+        if name in c.methods:
+            return c.methods[name]
+        c = c.base
+    return None
 
 def eval_block(stmts, env, out):
     for s in stmts:
@@ -756,9 +981,8 @@ def eval_block(stmts, env, out):
 
 def eval_program(prog):
     env = Env()
-    out = []
-    eval_block(prog.stmts, env, out)
-    return "".join(out)
+    bytecode = compile_program_to_bytecode(prog)
+    return run_bytecode(bytecode, env)
 
 def eval_stmt(stmt, env, out):
     if isinstance(stmt, Assign):
@@ -814,14 +1038,33 @@ def eval_stmt(stmt, env, out):
         eval_block(stmt.body, class_env, tmp_out)
         methods = {}
         for name, fn in class_env.funcs.items():
-            methods[name] = FunctionObject(fn.name, fn.params, fn.body, fn.env, is_method=True)
+            fn.is_method = True
+            methods[name] = fn
         attrs = dict(class_env.vars)
-        cls_obj = ClassObject(stmt.name, methods, attrs)
+        base_cls = None
+        if stmt.base_name is not None:
+            base_cls = env.get_class(stmt.base_name)
+        cls_obj = ClassObject(stmt.name, methods, attrs, base_cls)
         env.set_class(stmt.name, cls_obj)
         env.set_var(stmt.name, cls_obj)
     elif isinstance(stmt, FuncDef):
-        fn = FunctionObject(stmt.name, stmt.params, stmt.body, env, is_method=False)
+        fn = FunctionObject(stmt.name, stmt.params, stmt.body, env,
+                            is_method=False, annotations=stmt.annotations)
+        env.set_var(stmt.name, fn)
         env.set_func(stmt.name, fn)
+    elif isinstance(stmt, TryStmt):
+        try:
+            eval_block(stmt.body, env, out)
+        except LangException:
+            eval_block(stmt.handler, env, out)
+    elif isinstance(stmt, RaiseStmt):
+        val = eval_expr(stmt.expr, env)
+        raise LangException(val)
+    elif isinstance(stmt, NonlocalStmt):
+        for name in stmt.names:
+            env.declare_nonlocal(name)
+    elif isinstance(stmt, ImportStmt):
+        import_module(stmt.module, env)
     elif isinstance(stmt, ReturnStmt):
         val = eval_expr(stmt.expr, env)
         raise ReturnException(val)
@@ -857,23 +1100,45 @@ def eval_expr(expr, env):
             return seq_val[idx_val]
         except Exception as e:
             raise RuntimeError(f"index error: {e}")
+    if isinstance(expr, SliceIndex):
+        seq_val = eval_expr(expr.seq, env)
+        start = eval_expr(expr.start, env) if expr.start is not None else None
+        stop  = eval_expr(expr.stop, env) if expr.stop is not None else None
+        step  = eval_expr(expr.step, env) if expr.step is not None else None
+        try:
+            return seq_val[slice(start, stop, step)]
+        except Exception as e:
+            raise RuntimeError(f"slice error: {e}")
     if isinstance(expr, Attr):
         obj = eval_expr(expr.obj, env)
         name = expr.name
         if isinstance(obj, InstanceObject):
             if name in obj.fields:
                 return obj.fields[name]
-            if name in obj.cls.attributes:
-                return obj.cls.attributes[name]
-            if name in obj.cls.methods:
-                return obj.cls.methods[name]
+            val = class_lookup_attr(obj.cls, name)
+            if val is not None:
+                return val
+            m = class_lookup_method(obj.cls, name)
+            if m is not None:
+                return m
             raise RuntimeError(f"attribute {name} not found")
         if isinstance(obj, ClassObject):
-            if name in obj.attributes:
-                return obj.attributes[name]
-            if name in obj.methods:
-                return obj.methods[name]
+            val = class_lookup_attr(obj, name)
+            if val is not None:
+                return val
+            m = class_lookup_method(obj, name)
+            if m is not None:
+                return m
             raise RuntimeError(f"class attribute {name} not found")
+        if isinstance(obj, ModuleObject):
+            m_env = obj.env
+            if name in m_env.vars:
+                return m_env.vars[name]
+            if name in m_env.funcs:
+                return m_env.funcs[name]
+            if name in m_env.classes:
+                return m_env.classes[name]
+            raise RuntimeError(f"module attribute {name} not found")
         raise RuntimeError("attribute access only supported on objects")
     if isinstance(expr, MethodCall):
         obj = eval_expr(expr.obj, env)
@@ -917,10 +1182,15 @@ def eval_expr(expr, env):
                 return obj.get(args[0])
             raise RuntimeError(f"unsupported dict method {name}")
         if isinstance(obj, InstanceObject):
-            fn = obj.cls.methods.get(name)
+            fn = class_lookup_method(obj.cls, name)
             if fn is None:
                 raise RuntimeError(f"unknown method {name} on {obj.cls.name}")
             return call_method(obj, fn, expr.args, env)
+        if isinstance(obj, ModuleObject):
+            fn = obj.env.funcs.get(name)
+            if fn is None:
+                raise RuntimeError(f"unknown function {name} in module {obj.name}")
+            return call_function(fn, expr.args, env)
         raise RuntimeError(f"method {name} not supported on type {type(obj).__name__}")
     if isinstance(expr, BinOp):
         left = eval_expr(expr.left, env)
@@ -972,17 +1242,100 @@ def eval_expr(expr, env):
             fn = env.get_func(expr.name)
             return call_function(fn, expr.args, env)
         except NameError:
+            pass
+        try:
             cls = env.get_class(expr.name)
             return call_class(cls, expr.args, env)
+        except NameError:
+            pass
+
+        try:
+            val = env.get_var(expr.name)
+            if isinstance(val, FunctionObject):
+                return call_function(val, expr.args, env)
+            if isinstance(val, ClassObject):
+                return call_class(val, expr.args, env)
+        except NameError:
+            pass
+
+        raise NameError(f"undefined function or class or variable {expr.name}")
+
+
 
     raise RuntimeError("unknown expression")
 
+# =========================
+# JIT helpers
+# =========================
+
+def can_jit_expr(expr, params):
+    if isinstance(expr, IntLit):
+        return True
+    if isinstance(expr, Var):
+        return expr.name in params
+    if isinstance(expr, BinOp) and expr.op in ("+", "-", "*", "/"):
+        return can_jit_expr(expr.left, params) and can_jit_expr(expr.right, params)
+    return False
+
+def emit_python_expr(expr):
+    if isinstance(expr, IntLit):
+        return str(expr.value)
+    if isinstance(expr, Var):
+        return expr.name
+    if isinstance(expr, BinOp):
+        left = emit_python_expr(expr.left)
+        right = emit_python_expr(expr.right)
+        op = expr.op
+        if op == "/":
+            op = "//"
+        return f"({left} {op} {right})"
+    raise RuntimeError("unsupported expression for JIT")
+
+def maybe_jit_compile(fn):
+    if fn.jit_impl is not None:
+        return
+    if len(fn.body) != 1 or not isinstance(fn.body[0], ReturnStmt):
+        return
+    expr = fn.body[0].expr
+    if not can_jit_expr(expr, fn.params):
+        return
+    expr_code = emit_python_expr(expr)
+    params_code = ", ".join(fn.params)
+    src = f"lambda {params_code}: {expr_code}"
+    try:
+        fn.jit_impl = eval(src, {})
+    except Exception:
+        fn.jit_impl = None
+
+# =========================
+# Callers (functions / methods / classes)
+# =========================
+
 def call_function(fn, args_exprs, env):
-    local = Env(parent=fn.env)
+    fn.call_count += 1
+    if fn.call_count >= JIT_THRESHOLD and fn.jit_impl is None:
+        maybe_jit_compile(fn)
+
     if len(args_exprs) != len(fn.params):
         raise RuntimeError(f"{fn.name} expected {len(fn.params)} args, got {len(args_exprs)}")
+
+    arg_values = []
+    annotations = fn.annotations or {}
     for name, expr_arg in zip(fn.params, args_exprs):
         val = eval_expr(expr_arg, env)
+        expected_type_name = annotations.get(name)
+        if expected_type_name is not None:
+            tp = TYPE_MAP.get(expected_type_name)
+            if tp is not None and not isinstance(val, tp):
+                raise RuntimeError(f"type error in call to {fn.name}: param {name} expected {expected_type_name}, got {type(val).__name__}")
+        arg_values.append((name, val))
+
+    if fn.jit_impl is not None:
+        ordered = [v for _, v in arg_values]
+        return fn.jit_impl(*ordered)
+
+    local = Env(parent=fn.env)
+    for name, val in arg_values:
         local.set_var(name, val)
     try:
         eval_block(fn.body, local, out=[])
@@ -991,16 +1344,42 @@ def call_function(fn, args_exprs, env):
         return r.value
 
 def call_method(instance, fn, args_exprs, env):
-    local = Env(parent=fn.env)
+    fn.call_count += 1
+    if fn.call_count >= JIT_THRESHOLD and fn.jit_impl is None:
+        maybe_jit_compile(fn)
+
     if not fn.params:
         raise RuntimeError("method must have at least one parameter (self)")
     self_name = fn.params[0]
-    local.set_var(self_name, instance)
     expected = len(fn.params) - 1
     if len(args_exprs) != expected:
         raise RuntimeError(f"{fn.name} expected {expected} args, got {len(args_exprs)}")
+
+    annotations = fn.annotations or {}
+    arg_values = []
+
+    # self
+    expected_type_name = annotations.get(self_name)
+    if expected_type_name is not None:
+        # we don't really enforce type on self for now
+        pass
+    arg_values.append((self_name, instance))
+
     for name, expr_arg in zip(fn.params[1:], args_exprs):
         val = eval_expr(expr_arg, env)
+        expected_type_name = annotations.get(name)
+        if expected_type_name is not None:
+            tp = TYPE_MAP.get(expected_type_name)
+            if tp is not None and not isinstance(val, tp):
+                raise RuntimeError(f"type error in call to {fn.name}: param {name} expected {expected_type_name}, got {type(val).__name__}")
+        arg_values.append((name, val))
+
+    if fn.jit_impl is not None:
+        ordered = [v for _, v in arg_values]
+        return fn.jit_impl(*ordered)
+
+    local = Env(parent=fn.env)
+    for name, val in arg_values:
         local.set_var(name, val)
     try:
         eval_block(fn.body, local, out=[])
@@ -1010,10 +1389,33 @@ def call_method(instance, fn, args_exprs, env):
 
 def call_class(cls, args_exprs, env):
     inst = InstanceObject(cls, fields=dict(cls.attributes))
-    init = cls.methods.get("__init__")
+    init = class_lookup_method(cls, "__init__")
     if init is not None:
         call_method(inst, init, args_exprs, env)
     return inst
+
+# =========================
+# Import system
+# =========================
+
+def import_module(name, env):
+    if name in MODULE_CACHE:
+        env.set_var(name, MODULE_CACHE[name])
+        return
+    path = name + ".pa"
+    try:
+        src = open(path).read()
+    except FileNotFoundError:
+        raise RuntimeError(f"cannot import {name}: {path} not found")
+    tokens = lex(src)
+    parser = Parser(tokens)
+    prog = parser.parse_program()
+    module_env = Env()
+    module_out = []
+    eval_block(prog.stmts, module_env, module_out)
+    mod = ModuleObject(name, module_env)
+    MODULE_CACHE[name] = mod
+    env.set_var(name, mod)
 
 # =========================
 # Main
